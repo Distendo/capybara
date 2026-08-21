@@ -1,7 +1,7 @@
 # Capybara
 
 <p align="center">
-  <img src="https://github.com/FoarteBine/capybara/img/main/2026-08-21_18.35.43.png.webp" width="160">
+  <img src="https://raw.githubusercontent.com/FoarteBine/capybara/refs/heads/main/img/2026-08-21_18.35.43.png.webp" width="160">
 </p>
 
 <p align="center">
