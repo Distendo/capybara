@@ -11,7 +11,7 @@
 
 ## About
 
-Capybara is a local model runner inspired by Ollama.
+Capybara is a local model runner inspired by Ollama , and much better than Ollama.
 
 It is built to keep the basic workflow simple:
 
