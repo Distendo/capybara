@@ -1,14 +1,13 @@
 # Capybara
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/FoarteBine/capybara/refs/heads/main/img/2026-08-21_18.35.43.png.webp" width="160">
+  <img src="https://raw.githubusercontent.com/FoarteBine/capybara/refs/heads/main/img/2026-08-21_18.35.43.png.webp" width="260">
 </p>
 
-<p align="center">
-  A local AI runtime for running and serving language models.
-</p>
+<h1 align="center">
+  Ollama, but much better.
+</h1>
 
----
 
 ## About
 
@@ -23,7 +22,7 @@ capybara run llama3
 
 Models run locally on your machine and can also be exposed through an HTTP API.
 
----
+
 
 ## Install
 
@@ -36,7 +35,7 @@ cd capybara
 make build
 ```
 
----
+
 
 ## Usage
 
@@ -76,7 +75,7 @@ Start the API server:
 capybara serve
 ```
 
----
+
 
 ## API
 
@@ -129,7 +128,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
----
+
 
 ## Models
 
@@ -150,7 +149,7 @@ deepseek-r1      4.9 GB
 
 Model storage can be changed through the configuration file.
 
----
+
 
 ## Configuration
 
@@ -172,7 +171,7 @@ models:
 
 The configuration file is optional. Capybara works with sensible defaults when it is not present.
 
----
+
 
 ## Hardware
 
@@ -192,7 +191,7 @@ ROCm
 
 CPU inference is available as a fallback.
 
----
+
 
 ## Architecture
 
@@ -219,7 +218,7 @@ Capybara separates the command line interface, API, model management and inferen
 
 This makes it possible to add different inference backends without changing the public interface.
 
----
+
 
 ## Project structure
 
@@ -228,7 +227,7 @@ capybara/
 (for now nothing)
 ```
 
----
+
 
 ## Building
 
@@ -265,7 +264,7 @@ Capybara is currently under development.
 
 The CLI, API and runtime interfaces may change before the first stable release.
 
----
+
 
 ## License
 
