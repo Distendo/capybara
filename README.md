@@ -67,6 +67,8 @@ Only need the engine? `make engine` skips CLI setup.
 | `capybara logs [-n N]` | tail the engine log |
 | `capybara create -f Modelfile name` | create a model from a Modelfile |
 | `capybara launch <prog> --model M` | run a program wired to the local API |
+| `capybara agents` | list supported coding agents + install status |
+| `capybara agent <name> [--model M]` | install (if needed) and run a coding agent wired to Capybara |
 
 Running a model that isn't installed pulls it automatically first.
 
@@ -117,7 +119,24 @@ Built-in aliases:
 | `mistral` | Mistral 7B Instruct v0.3 |
 | `gemma2` | Gemma 2 9B IT |
 | `phi3` | Phi-3 mini 4k Instruct |
-| `deepseek-r1` | DeepSeek R1 Distill Qwen 7B |
+
+Model families take size and quantization suffixes — `family[:size][:quant]`:
+
+```
+capybara pull qwen3                 # Qwen3 8B (default size)
+capybara pull qwen3:0.6b            # smallest Qwen3
+capybara pull qwen3:14b:q8_0        # explicit quantization
+capybara pull qwen3-coder           # Qwen3 Coder 30B A3B (agentic coding)
+capybara pull gpt-oss:20b           # OpenAI open-weight MXFP4
+capybara pull gpt-oss:120b          # ... the big one (~65 GB)
+capybara pull deepseek-r1:32b       # R1 reasoning distill
+capybara pull gemma3:12b            # Gemma 3 (vision-capable builds)
+```
+
+Available families: `qwen3`, `qwen3-coder`, `gpt-oss`, `deepseek-r1`,
+`llama3.2`, `llama3.3`, `gemma3`, `phi4`, `mistral-nemo`, `devstral`,
+`smollm2`. Quantization defaults to Q4_K_M when a repo offers it; sharded
+(multi-part) releases are detected and downloaded completely.
 
 List what you have:
 
@@ -126,6 +145,33 @@ $ capybara list
 NAME                      SIZE      MODIFIED
 SmolLM2-135M-Instruct.Q2_K  84.2 MB  2026-08-22 12:40
 ```
+
+## Coding agents
+
+Capybara wires popular open-source coding agents from GitHub to your local
+models — installing any missing tool automatically:
+
+```
+capybara agents                     # list supported agents + install status
+capybara agent aider                # install if needed, pull its model, run it
+capybara agent opencode --model qwen3-coder
+capybara agent qwen-code -- --version   # everything after -- goes to the agent
+```
+
+| Agent | From | Default model |
+| --- | --- | --- |
+| `aider` | Aider-AI/aider | qwen3-coder |
+| `gptme` | gptme/gptme | qwen3 |
+| `open-interpreter` | openinterpreter/interpreter | qwen3 |
+| `shell-gpt` | TheR1D/shell_gpt | smollm2 |
+| `opencode` | sst/opencode | qwen3-coder |
+| `crush` | charmbracelet/crush | qwen3-coder |
+| `goose` | block/goose | qwen3 |
+| `qwen-code` | QwenLM/qwen-code | qwen3-coder |
+
+Every agent is started with `OPENAI_BASE_URL` / `OPENAI_API_BASE` /
+`OPENAI_API_KEY` pointed at Capybara, so it talks to whatever model you
+passed instead of a cloud API.
 
 ## Web UI (Open WebUI)
 

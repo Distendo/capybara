@@ -393,19 +393,20 @@ run_soft(){
 install_deps(){
   case "$OS_NAME" in
     macOS)
-      has brew || die "Homebrew is required on macOS: https://brew.sh"
+      ensure_brew
       run_soft "brew install tools" brew install git cmake ninja pkg-config python3 curl jq
       ;;
     Linux)
       if has apt-get; then
-        run_quiet "apt install tools" sudo apt-get update
-        run_quiet "apt install tools" sudo apt-get install -y git cmake ninja-build build-essential pkg-config python3 python3-tk curl jq
+        linux_install git cmake ninja-build build-essential pkg-config python3 python3-tk curl jq
       elif has dnf; then
-        run_quiet "dnf install tools" sudo dnf install -y git cmake ninja-build gcc gcc-c++ make pkgconf-pkg-config python3 python3-tk curl jq
+        linux_install git cmake ninja-build gcc gcc-c++ make pkgconf-pkg-config python3 python3-tk curl jq
       elif has pacman; then
-        run_quiet "pacman install tools" sudo pacman -Sy --needed --noconfirm git cmake ninja base-devel pkgconf python tk curl jq
+        linux_install git cmake ninja base-devel pkgconf python tk curl jq
       elif has zypper; then
-        run_quiet "zypper install tools" sudo zypper --non-interactive install git cmake ninja gcc gcc-c++ make pkg-config python3 python3-tk curl jq
+        linux_install git cmake ninja gcc gcc-c++ make pkg-config python3 python3-tk curl jq
+      elif has apk; then
+        linux_install git cmake ninja build-base pkgconf python3 curl jq
       else
         die "no supported Linux package manager found"
       fi
@@ -624,6 +625,95 @@ do_uninstall(){
   fi
 }
 
+# ------------------------------------------------------------- prerequisites
+ensure_brew(){
+  has brew && return 0
+  task "homebrew"
+  spin_start
+  if NONINTERACTIVE=1 /bin/bash -c \
+      "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" >>"$LOG" 2>&1; then
+    if [[ "$ARCH" == arm64 ]]; then
+      eval "$(/opt/homebrew/bin/brew shellenv)"
+    else
+      eval "$(/usr/local/bin/brew shellenv)"
+    fi
+    spin_stop; ok
+    local rc_file=""
+    case "${SHELL##*/}" in
+      zsh)  rc_file="$HOME/.zprofile" ;;
+      bash) rc_file="$HOME/.bash_profile" ;;
+      *)    return 0 ;;
+    esac
+    touch "$rc_file"
+    if ! grep -Fq "brew shellenv" "$rc_file" 2>/dev/null; then
+      # shellcheck disable=SC2016
+      printf '\neval "$(%s/brew shellenv)"\n' \
+        "$( [[ $ARCH == arm64 ]] && echo /opt/homebrew || echo /usr/local )" >> "$rc_file"
+      note "homebrew PATH added to $rc_file"
+    fi
+    has brew
+  else
+    spin_stop; bad
+    die "Homebrew bootstrap failed - install it from https://brew.sh and re-run"
+  fi
+}
+
+linux_install(){
+  local -a pkgs=("$@")
+  if has apt-get; then
+    run_quiet "apt update" sudo apt-get update
+    run_quiet "apt install" sudo apt-get install -y "${pkgs[@]}"
+  elif has dnf; then
+    run_quiet "dnf install" sudo dnf install -y "${pkgs[@]}"
+  elif has pacman; then
+    run_quiet "pacman install" sudo pacman -Sy --needed --noconfirm "${pkgs[@]}"
+  elif has zypper; then
+    run_quiet "zypper install" sudo zypper --non-interactive install "${pkgs[@]}"
+  elif has apk; then
+    run_soft "apk install" sudo apk add "${pkgs[@]}"
+  else
+    die "no supported package manager found - install ${pkgs[*]} manually"
+  fi
+}
+
+ensure_prerequisites(){
+  section "Prerequisites"
+  local -a missing=()
+  has curl   || missing+=(curl)
+  has git    || missing+=(git)
+  has python3 || missing+=(python3)
+
+  case "$OS_NAME" in
+    macOS)
+      if ! xcode-select -p >/dev/null 2>&1; then
+        task "xcode command line tools"; ok "installer launched"
+        note "finish the Xcode CLT install, then re-run this script"
+        xcode-select --install >/dev/null 2>&1 || true
+        exit 1
+      fi
+      if (( ${#missing[@]} )); then
+        ensure_brew
+        run_soft "brew install tools" brew install "${missing[@]}"
+        for tool in curl git python3; do
+          has "$tool" || die "$tool still missing after installation - see $LOG"
+        done
+      else
+        task "curl / git / python3"; ok "present"
+      fi
+      ;;
+    Linux|FreeBSD)
+      if (( ${#missing[@]} )); then
+        linux_install "${missing[@]}"
+        for tool in curl git python3; do
+          has "$tool" || die "$tool still missing after installation - see $LOG"
+        done
+      else
+        task "curl / git / python3"; ok "present"
+      fi
+      ;;
+  esac
+}
+
 # ------------------------------------------------------------------------- main
 main(){
   parse_args "$@"
@@ -642,6 +732,8 @@ main(){
   detect_backend
   task "accelerator"; ok "$GPU"
   task "cores"; ok "$(cores)"
+
+  ensure_prerequisites
 
   if [[ "$SOURCE_MODE" == local ]]; then
     task "sources"; ok "from checkout ($SRC_DIR)"

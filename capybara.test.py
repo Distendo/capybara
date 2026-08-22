@@ -93,6 +93,45 @@ class HfSpecTests(unittest.TestCase):
         self.assertNotEqual(capybara.resolve_alias("LLaMA3"), "LLaMA3")
         self.assertEqual(capybara.resolve_alias("unknown-model"), "unknown-model")
 
+    def test_resolve_family_should_use_default_variant(self):
+        spec = capybara.resolve_alias("qwen3")
+        self.assertTrue(spec.startswith("unsloth/Qwen3-8B-GGUF"), spec)
+
+    def test_resolve_family_should_support_size_and_quant_suffixes(self):
+        self.assertEqual(
+            capybara.resolve_alias("qwen3:14b"),
+            "unsloth/Qwen3-14B-GGUF")
+        self.assertEqual(
+            capybara.resolve_alias("qwen3:14b:q8_0"),
+            "unsloth/Qwen3-14B-GGUF:q8_0")
+        self.assertEqual(
+            capybara.resolve_alias("deepseek-r1:32b"),
+            "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF")
+        self.assertEqual(
+            capybara.resolve_alias("gpt-oss:20b"),
+            "ggml-org/gpt-oss-20b-GGUF")
+
+    def test_resolve_family_should_pass_through_unknown_variants(self):
+        self.assertEqual(capybara.resolve_alias("qwen3:nosize"), "qwen3:nosize")
+        self.assertEqual(capybara.resolve_alias("nosuch:1b"), "nosuch:1b")
+
+    def test_model_families_should_be_wellformed(self):
+        for family, variants in capybara.MODEL_FAMILIES.items():
+            self.assertIn("default", variants, family)
+            for name, spec in variants.items():
+                self.assertRegex(spec, r"^[^/]+/[^/]+$", f"{family}:{name}")
+
+    def test_agents_registry_should_be_complete(self):
+        for name, spec in capybara.AGENTS.items():
+            for key in ("github", "check", "install", "desc"):
+                self.assertIn(key, spec, f"{name} missing {key}")
+            self.assertNotIn(" ", name)
+
+    def test_clean_model_id_should_strip_extension_and_quant(self):
+        self.assertEqual(
+            capybara.clean_model_id(Path("Qwen3-8B-Q4_K_M.gguf")),
+            "qwen3-8b")
+
     def test_select_gguf_files_should_prefer_q4_k_m(self):
         files = ["m.Q8_0.gguf", "m.Q4_K_M.gguf", "m.Q2_K.gguf"]
         self.assertEqual(capybara.select_gguf_files(files), ["m.Q4_K_M.gguf"])
@@ -472,7 +511,7 @@ class OllamaInstallTests(unittest.TestCase):
 
         with mock.patch.object(capybara, "import_ollama_local", fake_import), \
              mock.patch.object(capybara, "pull_ollama_registry", fake_registry):
-            result = capybara.pull_model(settings, "gemma3:4b")
+            result = capybara.pull_model(settings, "ollama/gemma3:4b")
         self.assertEqual(calls, [("local", "gemma3", "4b"),
                                  ("registry", "gemma3", "4b")])
         self.assertEqual(result, settings.models / "gemma3.gguf")

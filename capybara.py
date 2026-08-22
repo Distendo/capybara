@@ -63,8 +63,170 @@ ALIASES: Dict[str, str] = {
     "mistral": "bartowski/Mistral-7B-Instruct-v0.3-GGUF:Q4_K_M",
     "gemma2": "bartowski/gemma-2-9b-it-GGUF:Q4_K_M",
     "phi3": "microsoft/Phi-3-mini-4k-instruct-gguf:q4",
-    "deepseek-r1": "unsloth/DeepSeek-R1-Distill-Qwen-7B-GGUF:Q4_K_M",
 }
+
+# Model families with size variants, resolved as family[:size][:quant].
+# Example: qwen3:14b:q6_k -> unsloth/Qwen3-14B-GGUF + Q6_K quantization.
+# Repos are official or well-maintained community GGUF mirrors; the default
+# quantization is Q4_K_M unless the repo ships a single fixed file.
+MODEL_FAMILIES: Dict[str, Dict[str, str]] = {
+    # Qwen3 line (Apr 2025) - dense sizes plus the 30B-A3B MoE.
+    "qwen3": {
+        "default": "unsloth/Qwen3-8B-GGUF",
+        "0.6b": "unsloth/Qwen3-0.6B-GGUF",
+        "1.7b": "unsloth/Qwen3-1.7B-GGUF",
+        "4b": "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+        "4b-think": "unsloth/Qwen3-4B-Thinking-2507-GGUF",
+        "8b": "unsloth/Qwen3-8B-GGUF",
+        "14b": "unsloth/Qwen3-14B-GGUF",
+        "32b": "unsloth/Qwen3-32B-GGUF",
+        "30b-a3b": "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+        "235b-a22b": "unsloth/Qwen3-235B-A22B-Instruct-2507-GGUF",
+    },
+    # Agentic coding model from the Qwen team.
+    "qwen3-coder": {
+        "default": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        "30b": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+    },
+    # OpenAI's open-weight models (Aug 2025) - MXFP4 native files.
+    "gpt-oss": {
+        "default": "ggml-org/gpt-oss-20b-GGUF",
+        "20b": "ggml-org/gpt-oss-20b-GGUF",
+        "120b": "ggml-org/gpt-oss-120b-GGUF",
+    },
+    # DeepSeek R1 reasoning distills.
+    "deepseek-r1": {
+        "default": "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+        "0528-8b": "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+        "1.5b": "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF",
+        "7b": "unsloth/DeepSeek-R1-Distill-Qwen-7B-GGUF",
+        "14b": "unsloth/DeepSeek-R1-Distill-Qwen-14B-GGUF",
+        "32b": "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF",
+    },
+    "llama3.2": {
+        "default": "bartowski/Meta-Llama-3.2-3B-Instruct-GGUF",
+        "1b": "bartowski/Meta-Llama-3.2-1B-Instruct-GGUF",
+        "3b": "bartowski/Meta-Llama-3.2-3B-Instruct-GGUF",
+    },
+    "llama3.3": {
+        "default": "bartowski/Meta-Llama-3.3-70B-Instruct-GGUF",
+        "70b": "bartowski/Meta-Llama-3.3-70B-Instruct-GGUF",
+    },
+    # Google Gemma 3 - ggml.org builds ship the vision projector too.
+    "gemma3": {
+        "default": "ggml-org/gemma-3-4b-it-GGUF",
+        "1b": "ggml-org/gemma-3-1b-it-GGUF",
+        "4b": "ggml-org/gemma-3-4b-it-GGUF",
+        "12b": "ggml-org/gemma-3-12b-it-GGUF",
+        "27b": "ggml-org/gemma-3-27b-it-GGUF",
+    },
+    # Microsoft Phi-4 line.
+    "phi4": {
+        "default": "microsoft/phi-4-gguf",
+        "mini": "microsoft/Phi-4-mini-instruct-gguf",
+    },
+    "mistral-nemo": {
+        "default": "bartowski/Mistral-Nemo-Instruct-2407-GGUF",
+    },
+    # Mistral's coding models.
+    "devstral": {
+        "default": "mistralai/Devstral-Small-2505_gguf",
+    },
+    "smollm2": {
+        "default": "HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF",
+        "135m": "HuggingFaceTB/SmolLM2-135M-Instruct-GGUF",
+        "360m": "HuggingFaceTB/SmolLM2-360M-Instruct-GGUF",
+    },
+}
+
+QUANT_TOKEN_RE = re.compile(r"^(?:iq|q)\d[\w]*$", re.IGNORECASE)
+
+# Open-source coding agents from GitHub that speak the OpenAI protocol.
+# Capybara installs missing tools on demand, pulls their model and execs
+# them wired to the local API. Flags with {url}/{model} placeholders are
+# appended automatically; everything else is passed through untouched.
+AGENTS: Dict[str, Dict[str, Any]] = {
+    "aider": {
+        "github": "Aider-AI/aider",
+        "desc": "AI pair programming in your terminal",
+        "check": "aider",
+        "install": ["pipx", "install", "aider-chat"],
+        "fallback": [sys.executable, "-m", "pip", "install", "--user",
+                     "aider-chat"],
+        "flags": [["--openai-api-base", "{url}"],
+                  ["--model", "openai/{model}"]],
+        "hint": "qwen3-coder",
+    },
+    "gptme": {
+        "github": "gptme/gptme",
+        "desc": "Terminal agent with tools and local workspace access",
+        "check": "gptme",
+        "install": ["pipx", "install", "gptme[server]"],
+        "fallback": [sys.executable, "-m", "pip", "install", "--user",
+                     "gptme"],
+        "flags": [],
+        "env": {"OPENAI_API_BASE": "{url}"},
+        "hint": "qwen3",
+    },
+    "open-interpreter": {
+        "github": "openinterpreter/interpreter",
+        "desc": "Natural-language interface for your computer",
+        "check": "interpreter",
+        "install": ["pipx", "install", "open-interpreter"],
+        "fallback": [sys.executable, "-m", "pip", "install", "--user",
+                     "open-interpreter"],
+        "flags": [],
+        "env": {"OPENAI_API_BASE": "{url}"},
+        "hint": "qwen3",
+    },
+    "shell-gpt": {
+        "github": "TheR1D/shell_gpt",
+        "desc": "sgpt - command-line productivity via LLMs",
+        "check": "sgpt",
+        "install": ["pipx", "install", "shell-gpt"],
+        "fallback": [sys.executable, "-m", "pip", "install", "--user",
+                     "shell-gpt"],
+        "flags": [],
+        "env": {"OPENAI_API_BASE": "{url}", "API_KEY": "capybara"},
+        "hint": "smollm2",
+    },
+    "opencode": {
+        "github": "sst/opencode",
+        "desc": "AI coding agent built for the terminal (TUI)",
+        "check": "opencode",
+        "install": ["npm", "install", "-g", "opencode-ai@latest"],
+        "flags": [],
+        "hint": "qwen3-coder",
+    },
+    "crush": {
+        "github": "charmbracelet/crush",
+        "desc": "Glamorous AI coding agent from the Charm team",
+        "check": "crush",
+        "install": ["npm", "install", "-g", "@charmbracelet/crush"],
+        "fallback": ["brew", "install", "crush"],
+        "flags": [],
+        "hint": "qwen3-coder",
+    },
+    "goose": {
+        "github": "block/goose",
+        "desc": "Extensible developer agent by Block",
+        "check": "goose",
+        "install": ["brew", "install", "block/goose/goose"],
+        "flags": [],
+        "hint": "qwen3",
+    },
+    "qwen-code": {
+        "github": "QwenLM/qwen-code",
+        "desc": "Qwen's CLI coding workflow tool (gemini-cli fork)",
+        "check": "qwen",
+        "install": ["npm", "install", "-g", "@qwen-code/qwen-code@latest"],
+        "flags": [],
+        "env": {"OPENAI_MODEL": "{model}"},
+        "hint": "qwen3-coder",
+    },
+}
+
+DEFAULT_AGENT = "qwen3"
 
 DEFAULT_NUM_PREDICT = 2048
 
@@ -308,8 +470,29 @@ def load_settings(home: Optional[Path] = None) -> Settings:
 
 
 def resolve_alias(spec: str) -> str:
-    """Expand short model names like 'llama3' to HF repo specs."""
-    return ALIASES.get(spec.lower(), spec)
+    """Expand short model names like 'llama3' to HF repo specs.
+
+    Supports flat aliases plus model families with optional size and
+    quantization suffixes: qwen3, qwen3:14b, qwen3:14b:q8_0.
+    """
+    low = spec.lower()
+    if low in ALIASES:
+        return ALIASES[low]
+    parts = [p for p in low.split(":") if p]
+    if not parts:
+        return spec
+    family = MODEL_FAMILIES.get(parts[0])
+    if family is None:
+        return spec
+    rest = parts[1:]
+    quant = None
+    if rest and QUANT_TOKEN_RE.match(rest[-1]):
+        quant = rest.pop()
+    variant = "-".join(rest) if rest else "default"
+    base = family.get(variant)
+    if base is None:
+        return spec
+    return f"{base}:{quant}" if quant else base
 
 
 def split_hf_spec(spec: str) -> Optional[Tuple[str, Optional[str]]]:
@@ -502,9 +685,10 @@ def pull_model(settings: Settings, spec: str) -> Path:
             print(f"installed {dest}")
         return settings.models / chosen[-1]
 
-    known = ", ".join(sorted(ALIASES))
+    known = ", ".join(sorted(set(ALIASES) | set(MODEL_FAMILIES)))
     die(f"unknown model '{spec}' - use a local GGUF path, a URL, owner/repo[:quant],\n"
-        f"any Ollama library model (e.g. gemma3:4b, ollama/phi4), or an alias ({known})")
+        f"any Ollama library model (e.g. ollama/gemma3, ollama/phi4), or an alias\n"
+        f"({known}; families accept size and quant suffixes, e.g. qwen3:14b:q8_0)")
 
 
 def hf_spec_local_files(settings: Settings, spec: str) -> List[Path]:
@@ -1416,6 +1600,132 @@ def open_ui(settings: Settings, model: Optional[Path] = None) -> None:
     webbrowser.open(ui_url)
 
 
+# --- coding agents -----------------------------------------------------
+
+def clean_model_id(model: Path) -> str:
+    """Model file name without .gguf and quantization suffix, lowercased."""
+    return QUANT_SUFFIX_RE.sub("", model.stem).lower()
+
+
+def run_quiet(cmd: List[str]) -> bool:
+    """Run an installer command, showing output; True on success."""
+    printable = " ".join(cmd)
+    print(f"+ {printable}")
+    try:
+        return subprocess.run(cmd, check=False).returncode == 0
+    except OSError as exc:
+        print(f"  failed: {exc}")
+        return False
+
+
+def is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def ensure_backend(backend: str) -> bool:
+    """Best-effort installation of a missing tool installer backend."""
+    if shutil.which(backend):
+        return True
+    if IS_WINDOWS or backend not in ("pipx", "npm", "node"):
+        return False
+    node_pkgs = {"brew": ["node"], "apt": ["npm"],
+                 "dnf": ["nodejs", "npm"], "pacman": ["npm"],
+                 "zypper": ["nodejs20"], "apk": ["nodejs", "npm"]}
+    pipx_pkgs = {"brew": ["pipx"], "apt": ["pipx"], "dnf": ["pipx"],
+                 "pacman": ["python-pipx"], "zypper": ["python311-pipx"],
+                 "apk": ["py3-pipx"]}
+    wanted = node_pkgs if backend in ("npm", "node") else pipx_pkgs
+    for manager, pkgs in wanted.items():
+        if not shutil.which("brew" if manager == "brew" else
+                            ("apt-get" if manager == "apt" else manager)):
+            continue
+        cmd = {"brew": ["brew", "install"], "apt": ["apt-get", "install", "-y"],
+               "dnf": ["dnf", "install", "-y"],
+               "pacman": ["pacman", "-S", "--noconfirm"],
+               "zypper": ["zypper", "--non-interactive", "install"],
+               "apk": ["apk", "add"]}[manager]
+        if not is_root() and manager != "brew":
+            cmd = ["sudo"] + cmd
+        if run_quiet(cmd + pkgs):
+            break
+    return shutil.which(backend) is not None
+
+
+def ensure_agent_tool(name: str, spec: Dict[str, Any]) -> str:
+    """Return the agent executable, installing it first when missing."""
+    found = shutil.which(spec["check"])
+    if found:
+        return found
+    github = spec.get("github", "")
+    print(f"'{name}' is not installed - installing it now "
+          f"(source: https://github.com/{github})")
+    attempts: List[List[str]] = [list(spec["install"])]
+    if spec.get("fallback"):
+        attempts.append(list(spec["fallback"]))
+    for attempt in attempts:
+        backend = attempt[0]
+        if backend.lower() in ("pipx", "npm", "brew") \
+                and not Path(backend).is_absolute() \
+                and not ensure_backend(backend.lower()):
+            continue
+        if not run_quiet(attempt):
+            continue
+        found = shutil.which(spec["check"])
+        if found:
+            print(f"installed {name} ({github})")
+            return found
+    die(f"could not install '{name}' automatically.\n"
+        f"Install it manually - https://github.com/{github}")
+
+
+def do_agents() -> None:
+    """List the supported coding agents and their install status."""
+    rows = []
+    for name, spec in AGENTS.items():
+        status = "installed" if shutil.which(spec["check"]) else "missing"
+        rows.append((name, status, spec.get("hint") or DEFAULT_AGENT,
+                     spec.get("github", ""), spec.get("desc", "")))
+    widths = [max(len(str(r[i])) for r in rows)
+              for i in range(len(rows[0]))]
+    print(f"{'NAME':{widths[0]}}  {'STATUS':9} {'MODEL':{widths[2]}} "
+          f"{'GITHUB':{widths[3]}} DESCRIPTION")
+    for row in rows:
+        print(f"{row[0]:{widths[0]}}  {row[1]:9} {row[2]:{widths[2]}} "
+              f"{row[3]:{widths[3]}} {row[4]}")
+    print(f"\nrun one with: capybara agent <name> [--model MODEL] "
+          f"[extra args...]\nmissing tools are installed automatically")
+
+
+def do_agent(settings: Settings, args: argparse.Namespace) -> None:
+    """Install (when needed), wire and launch a coding agent."""
+    spec = AGENTS.get(args.name.lower())
+    if spec is None:
+        known = ", ".join(sorted(AGENTS))
+        die(f"unknown agent '{args.name}' - known agents: {known}")
+    exe = ensure_agent_tool(args.name, spec)
+    model_name = args.model or spec.get("hint") or DEFAULT_AGENT
+    model = resolve_model_or_alias(settings, model_name)
+    if model is None:
+        model = pull_model(settings, model_name)
+    ensure_server(settings, model)
+
+    env = os.environ.copy()
+    env["OPENAI_BASE_URL"] = settings.openai_url
+    env["OPENAI_API_BASE"] = settings.openai_url
+    env["OPENAI_API_KEY"] = "capybara"
+    fmt = {"url": settings.openai_url, "model": clean_model_id(model)}
+    for key, value in (spec.get("env") or {}).items():
+        env[key] = value.format(**fmt)
+
+    cmd = [exe]
+    for flag in spec.get("flags", []):
+        cmd.extend(part.format(**fmt) for part in flag)
+    cmd.extend(args.extra)
+    print(f"{args.name} -> {settings.openai_url} "
+          f"(model: {clean_model_id(model)})")
+    raise SystemExit(subprocess.run(cmd, env=env, check=False).returncode)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argument parser."""
     parser = argparse.ArgumentParser(prog="capybara", description=__doc__)
@@ -1468,15 +1778,62 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("integration")
     launch.add_argument("--model")
 
+    sub.add_parser("agents", help="list supported coding agents")
+
+    agent = sub.add_parser("agent", help="run a coding agent wired to Capybara "
+                           "(installs it first when missing)")
+    agent.add_argument("name", help="agent name (see: capybara agents)")
+    agent.add_argument("--model", help="model to use "
+                       "(default: the agent's recommended one)")
+    agent.add_argument("extra", nargs=argparse.REMAINDER,
+                       help="everything after the agent name is passed "
+                            "through to it")
+
     sub.add_parser("version", help="print version")
     sub.add_parser("help", help="show help")
     return parser
 
 
+def split_agent_argv(argv: List[str]) -> Tuple[str, Optional[str], List[str]]:
+    """Split 'agent NAME [--model M] EXTRA...' without argparse interference.
+
+    Everything that is not the agent name or a --model option is passed
+    through verbatim, so agent flags like --version survive untouched.
+    """
+    name: Optional[str] = None
+    model: Optional[str] = None
+    extra: List[str] = []
+    rest = argv[1:]
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token == "--model" and index + 1 < len(rest):
+            model = rest[index + 1]
+            index += 2
+            continue
+        if token.startswith("--model="):
+            model = token.split("=", 1)[1]
+            index += 1
+            continue
+        if name is None:
+            name = token
+        else:
+            extra.append(token)
+        index += 1
+    return (name or "", model, extra)
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     """CLI entry point."""
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["agent"]:
+        # parsed by hand: argparse would eat flags meant for the agent
+        name, model, extra = split_agent_argv(argv)
+        args = argparse.Namespace(cmd="agent", name=name, model=model,
+                                  extra=extra)
+    else:
+        parser = build_parser()
+        args = parser.parse_args(argv)
     if args.cmd in (None, "help"):
         parser.print_help()
         return
@@ -1544,6 +1901,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         if args.model:
             env["CAPYBARA_MODEL"] = args.model
         subprocess.run([exe], env=env, check=False)
+    elif args.cmd == "agents":
+        do_agents()
+    elif args.cmd == "agent":
+        do_agent(settings, args)
     else:
         die(f"unknown command: {args.cmd}")
 
