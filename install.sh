@@ -7,7 +7,6 @@ SRC="$CAPYBARA_HOME/llama.cpp"
 BIN="$CAPYBARA_HOME/bin"
 MODELS="$CAPYBARA_HOME/models"
 RUN="$CAPYBARA_HOME/run"
-GUI="$CAPYBARA_HOME/gui.py"
 
 say(){ printf '[capybara] %s\n' "$1"; }
 die(){ printf '[capybara] error: %s\n' "$1" >&2; exit 1; }
@@ -96,6 +95,7 @@ install_engine(){
 
 install_python(){
   cp "$(dirname "$0")/capybara.py" "$BIN/capybara.py"
+  cp "$(dirname "$0")/capybara.py" "$CAPYBARA_HOME/capybara.py"
   cp "$(dirname "$0")/gui.py" "$CAPYBARA_HOME/gui.py"
   chmod +x "$BIN/capybara.py"
 
@@ -133,7 +133,11 @@ EOF2
   esac
   if [[ -n "${rc:-}" ]]; then
     touch "$rc"
-    grep -Fq "$INSTALL_BIN" "$rc" 2>/dev/null || printf '\nexport PATH="%s:$PATH"\n' "$INSTALL_BIN" >> "$rc"
+    if ! grep -Fq "$INSTALL_BIN" "$rc" 2>/dev/null; then
+      # $PATH is written literally (unexpanded) into the rc file on purpose.
+      # shellcheck disable=SC2016
+      printf '\nexport PATH="%s:$PATH"\n' "$INSTALL_BIN" >> "$rc"
+    fi
   fi
 }
 
@@ -143,6 +147,10 @@ main(){
   say "Backend: $BACKEND ($GPU)"
   install_deps
   install_engine
+  if [[ "${CAPYBARA_ENGINE_ONLY:-0}" == "1" ]]; then
+    say "Engine-only install requested; skipping CLI setup"
+    return
+  fi
   install_python
   write_env
   echo
@@ -150,12 +158,14 @@ main(){
   echo "CLI: capybara"
   echo "GUI: capybara-gui"
   echo "Models: $MODELS"
-  echo "Ollama API: http://127.0.0.1:11434/api"
   echo "OpenAI API: http://127.0.0.1:11434/v1"
   echo
   echo "Try:"
-  echo "  capybara pull tensorblock/SmolLM2-135M-Instruct-GGUF:Q2_K"
-  echo "  capybara run SmolLM2-135M-Instruct-Q2_K.gguf"
+  echo "  capybara pull smollm          # tiny 135M model, fast download"
+  echo "  capybara run smollm 'hi!'     # one-shot prompt"
+  echo "  capybara serve                # OpenAI-compatible API on :11434/v1"
   echo "  capybara-gui"
+  echo
+  echo "Optional config: $CAPYBARA_HOME/config.yaml"
 }
 main "$@"
