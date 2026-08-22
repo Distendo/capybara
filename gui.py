@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
+"""Capybara desktop companion - a minimal tkinter front end."""
 import json, os, subprocess, sys, threading, urllib.error, urllib.request
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-HOME=Path(os.environ.get('CAPYBARA_HOME',str(Path.home()/'.capybara')))
-MODELS=Path(os.environ.get('CAPYBARA_MODELS',str(HOME/'models')))
-CLI=HOME/'bin'/'capybara.py'; PORT=int(os.environ.get('CAPYBARA_PORT','11434'))
-BASE=f'http://127.0.0.1:{PORT}'
+HOME = Path(os.environ.get('CAPYBARA_HOME', str(Path.home() / '.capybara')))
+sys.path.insert(0, str(HOME))
+try:
+    import capybara as cb  # installed alongside gui.py by install.sh
+    _settings = cb.load_settings(HOME)
+    MODELS, HOST, PORT, CLI = _settings.models, _settings.host, _settings.port, HOME / 'bin' / 'capybara.py'
+except Exception:
+    MODELS = Path(os.environ.get('CAPYBARA_MODELS', str(HOME / 'models')))
+    HOST = os.environ.get('CAPYBARA_HOST', '127.0.0.1')
+    PORT = int(os.environ.get('CAPYBARA_PORT', '11434'))
+    CLI = HOME / 'bin' / 'capybara.py'
+BASE = f'http://{HOST}:{PORT}'
 
 class App(tk.Tk):
     def __init__(self):
