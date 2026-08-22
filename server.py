@@ -4,7 +4,7 @@
 The gateway is a single long-lived process that owns one llama.cpp
 `llama-server` child process bound to an internal loopback port. It exposes:
 
-* ``GET /``            - the built-in chat UI (ui/index.html)
+ * ``GET /``            - service descriptor (JSON)
 * ``GET /api/status``  - engine/model status as JSON
 * ``GET /api/models``  - installed models as JSON
 * ``POST /api/use``    - hot-swap the loaded model (JSON ``{"model": name}``)
@@ -167,7 +167,6 @@ class Gateway(BaseHTTPRequestHandler):
     """HTTP request handler wired to an EngineManager instance."""
 
     manager: EngineManager
-    ui_html: bytes
 
     protocol_version = "HTTP/1.1"
     server_version = "Capybara"
@@ -179,7 +178,12 @@ class Gateway(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
-            self._send_bytes(200, self.ui_html, "text/html; charset=utf-8")
+            self._send_json(200, {
+                "service": "capybara",
+                "version": cb.VERSION,
+                "api": "/v1/chat/completions (OpenAI-compatible)",
+                "ui": "run 'capybara ui' for the Open WebUI frontend",
+            })
         elif path == "/api/status":
             self._send_json(200, self.status())
         elif path == "/api/models":
@@ -354,11 +358,6 @@ def main(argv: Optional[list] = None) -> int:
             return 1
         model = installed[0]
 
-    ui_candidates = [Path(__file__).resolve().parent / "ui" / "index.html",
-                     settings.home / "ui" / "index.html"]
-    ui_path = next((p for p in ui_candidates if p.exists()), None)
-    Gateway.ui_html = ui_path.read_bytes() if ui_path else (
-        b"<h1>Capybara</h1><p>ui/index.html not found</p>")
     Gateway.manager = mgr
 
     try:

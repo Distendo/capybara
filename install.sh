@@ -203,8 +203,6 @@ install_python(){
   cp "$(dirname "$0")/capybara.py" "$BIN/capybara.py"
   cp "$(dirname "$0")/capybara.py" "$CAPYBARA_HOME/capybara.py"
   cp "$(dirname "$0")/server.py" "$CAPYBARA_HOME/server.py"
-  mkdir -p "$CAPYBARA_HOME/ui"
-  cp "$(dirname "$0")/ui/index.html" "$CAPYBARA_HOME/ui/index.html"
   if [[ -f "$(dirname "$0")/gui.py" ]]; then
     cp "$(dirname "$0")/gui.py" "$CAPYBARA_HOME/gui.py"
   fi

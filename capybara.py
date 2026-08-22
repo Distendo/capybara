@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 VERSION = "1.0.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11434
+DEFAULT_WEBUI_PORT = 8080
 DEFAULT_CONTEXT = 10240
 DEFAULT_BATCH = 2048
 DEFAULT_UBATCH = 512
@@ -99,6 +100,8 @@ class Settings:
         self.home = home
         self.host = str(pick("CAPYBARA_HOST", "server", "host", default=DEFAULT_HOST))
         self.port = int(pick("CAPYBARA_PORT", "server", "port", default=DEFAULT_PORT))
+        self.webui_port = int(pick("CAPYBARA_WEBUI_PORT", "server", "webui_port",
+                                   default=DEFAULT_WEBUI_PORT))
         models_dir = pick("CAPYBARA_MODELS", "models", "directory", default=str(home / "models"))
         self.models = Path(models_dir).expanduser()
         threads = pick("CAPYBARA_THREADS", "runtime", "threads", default=os.cpu_count() or 4)
@@ -934,8 +937,18 @@ def do_ps(settings: Settings) -> None:
 
 
 def open_ui(settings: Settings, model: Optional[Path] = None) -> None:
-    """Make sure the server is up, then open the web UI in a browser."""
+    """Make sure the server is up, then open the Open WebUI frontend.
+
+    Launch order: reuse an Open WebUI already listening on webui_port,
+    else start one via the ``open-webui`` command if installed,
+    else print setup instructions.
+    """
+    import shutil
+    import subprocess
+    import time
+    import urllib.request
     import webbrowser
+
     if model is None:
         model = resolve_model(settings, os.environ.get("CAPYBARA_MODEL", ""))
     if model is None:
@@ -946,9 +959,65 @@ def open_ui(settings: Settings, model: Optional[Path] = None) -> None:
     state = server_state(settings)
     if not (server_ready(settings) and state_is_ours(settings, state)):
         start_server(settings, model)
-    url = f"http://{settings.host}:{settings.port}/"
-    print(f"Capybara UI: {url}")
-    webbrowser.open(url)
+
+    api_url = f"http://{settings.host}:{settings.port}/v1"
+    ui_url = f"http://{settings.host}:{settings.webui_port}/"
+
+    def webui_healthy() -> bool:
+        try:
+            with urllib.request.urlopen(f"{ui_url}health", timeout=1) as resp:
+                return resp.status == 200
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+            return False
+
+    if port_has_listener(settings, settings.webui_port):
+        print(f"Open WebUI already running: {ui_url}")
+        webbrowser.open(ui_url)
+        return
+
+    launcher = shutil.which("open-webui")
+    if not launcher:
+        die("Open WebUI is not installed. Install it with either:\n"
+            "  pip install open-webui\n"
+            "or:\n"
+            "  docker run -d --name capybara-webui -p 8080:8080 \\\n"
+            f"    -e OPENAI_API_BASE_URL={api_url.replace('127.0.0.1', 'host.docker.internal')} \\\n"
+            "    -e OPENAI_API_KEY=capybara -e WEBUI_AUTH=false \\\n"
+            "    --add-host=host.docker.internal:host-gateway \\\n"
+            "    -v capybara-webui:/app/backend/data --restart unless-stopped \\\n"
+            "    ghcr.io/open-webui/open-webui:main\n"
+            "then run 'capybara ui' again.")
+
+    data_dir = settings.home / "webui"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    log_path = settings.home / "logs"
+    log_path.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update({
+        "DATA_DIR": str(data_dir),
+        "OPENAI_API_BASE_URL": api_url,
+        "OPENAI_API_KEYS": "capybara",
+        "WEBUI_AUTH": "false",
+    })
+    with open(log_path / "webui.log", "ab") as log:
+        proc = subprocess.Popen([launcher, "serve", "--port", str(settings.webui_port)],
+                                stdout=log, stderr=log,
+                                start_new_session=True)
+    print(f"starting Open WebUI (pid {proc.pid}) - first boot can take a minute...")
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if webui_healthy():
+            break
+        if proc.poll() is not None:
+            die(f"Open WebUI exited with code {proc.returncode} - "
+                f"see {log_path / 'webui.log'}")
+        time.sleep(1)
+    else:
+        die("Open WebUI did not become ready within 180s - "
+            f"see {log_path / 'webui.log'}")
+    print(f"Capybara API: {api_url}")
+    print(f"Open WebUI:   {ui_url}")
+    webbrowser.open(ui_url)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -962,7 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("-F", "--foreground", action="store_true",
                        help="run attached to this terminal instead of daemonizing")
 
-    sub.add_parser("ui", help="open the web UI in a browser")
+    sub.add_parser("ui", help="start/launch the Open WebUI frontend in a browser")
 
     run = sub.add_parser("run", help="run a model (interactive chat or one-shot)")
     run.add_argument("model")

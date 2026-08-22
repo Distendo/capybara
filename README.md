@@ -22,8 +22,8 @@ OpenAI-compatible HTTP API with a built-in web UI.
 
 ### What makes it better
 
-- **Web UI included** — every server ships with a chat interface at `http://localhost:11434`. Streaming, markdown, conversation history, live model switching. No extensions.
-- **Hot-swapping models** — switch models through the UI, API or CLI without stopping the server. Requests queue until the swap finishes; clients never see an error.
+- **Open WebUI integration** — one command wires up the full [Open WebUI](https://github.com/open-webui/open-webui) chat frontend (streaming, markdown, multi-chat, RAG, voice) against your local models. No configuration.
+- **Hot-swapping models** — switch models through the API or CLI without stopping the server. Requests queue until the swap finishes; clients never see an error.
 - **Fast installs** — signed prebuilt llama.cpp binaries for macOS/Linux when available; falls back to compiling for your exact backend otherwise.
 - **Honest process management** — PID reuse protection, orphan cleanup, foreign-port detection ("is Ollama running?") instead of cryptic failures.
 
@@ -61,7 +61,7 @@ Only need the engine? `make engine` skips CLI setup.
 | `capybara rm <model>` | remove a model |
 | `capybara cp <src> <dst>` | copy a model under a new name |
 | `capybara serve [--model M] [-F]` | start the API server (`-F` = foreground) |
-| `capybara ui [--model M]` | start the server and open the Web UI in your browser |
+| `capybara ui [--model M]` | start the server and open the Open WebUI frontend |
 | `capybara ps` | server status |
 | `capybara stop` | stop the API server |
 | `capybara logs [-n N]` | tail the engine log |
@@ -123,20 +123,38 @@ NAME                      SIZE      MODIFIED
 SmolLM2-135M-Instruct.Q2_K  84.2 MB  2026-08-22 12:40
 ```
 
-## Web UI
+## Web UI (Open WebUI)
 
-Every server ships with a full chat interface — no extensions, no build step:
+Capybara uses [Open WebUI](https://github.com/open-webui/open-webui) as its chat
+frontend — the full-featured, self-hosted ChatGPT alternative. One command:
 
 ```
-capybara ui            # start server + open browser
+capybara ui            # start server + launch Open WebUI wired to it
 ```
 
-or just visit `http://localhost:11434` while the server runs.
+Install Open WebUI once with either:
 
-Features: streaming responses with live token stats, markdown + code blocks
-with copy buttons, conversation sidebar (stored in your browser), settings for
-system prompt / temperature / top_p / max tokens, model switcher with hot-swap,
-server status indicator.
+```
+pip install open-webui
+```
+
+or Docker:
+
+```
+docker run -d --name capybara-webui -p 8080:8080 \
+  -e OPENAI_API_BASE_URL=http://host.docker.internal:11434/v1 \
+  -e OPENAI_API_KEY=capybara -e WEBUI_AUTH=false \
+  --add-host=host.docker.internal:host-gateway \
+  -v capybara-webui:/app/backend/data --restart unless-stopped \
+  ghcr.io/open-webui/open-webui:main
+```
+
+`capybara ui` reuses an Open WebUI that is already running on port 8080,
+launches the local one otherwise (first boot can take a minute), and opens
+your browser. You get streaming, markdown, conversation history, model
+switching and more — all backed by your local Capybara server.
+
+The webui port defaults to 8080; override with `CAPYBARA_WEBUI_PORT`.
 
 ## API
 
@@ -264,7 +282,7 @@ and inference backend.
                     │
           ┌─────────┴─────────┐
           │                   │
-         CLI              Web UI (static)
+         CLI              Open WebUI
           │                   │
           └─────────┬─────────┘
                     │
@@ -290,8 +308,7 @@ the public interface.
 ```
 capybara/
 ├── capybara.py        # single-file CLI: model manager + runtime controller
-├── server.py          # gateway: OpenAI proxy, hot-swap, management API, Web UI host
-├── ui/index.html      # self-contained web chat interface
+├── server.py          # gateway: OpenAI proxy, hot-swap, management API
 ├── capybara.test.py   # unit tests (stdlib unittest, no dependencies)
 ├── gui.py             # desktop launcher (opens capybara ui)
 ├── install.sh         # engine install (prebuilt-first) + CLI setup
