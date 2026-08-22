@@ -269,13 +269,13 @@ main(){
   echo
   echo "Capybara installed."
   echo "CLI:     capybara"
-  echo "GUI:     capybara ui        (opens the built-in web app)"
+  echo "GUI:     capybara ui        (launches Open WebUI against the local server)"
   echo "Models:  $MODELS"
   echo "API:     http://127.0.0.1:11434/v1"
   echo
   echo "Try:"
   echo "  capybara pull smollm          # tiny 135M model, fast download"
-  echo "  capybara serve                # web UI at http://localhost:11434"
+  echo "  capybara serve                # OpenAI-compatible API at http://localhost:11434"
   echo "  capybara run smollm 'hi!'     # one-shot prompt"
   echo "  capybara ui                   # chat in your browser"
   echo

@@ -379,8 +379,17 @@ def main(argv: Optional[list] = None) -> int:
     def shutdown(signum: int, frame: Any) -> None:
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+    def install_signals() -> None:
+        for name in ("SIGTERM", "SIGINT", "SIGBREAK"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, shutdown)
+            except (OSError, ValueError):
+                pass  # not supported on this platform
+
+    install_signals()
 
     print(f"Capybara {cb.VERSION} serving {mgr.model.name} "
           f"on http://{settings.host}:{settings.port} (UI: /, API: /v1)")

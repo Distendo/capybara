@@ -9,7 +9,7 @@ jobs:
   tests:
     strategy:
       matrix:
-        os: [ubuntu-24.04, macos-14]
+        os: [ubuntu-24.04, macos-14, windows-latest]
         python: ["3.9", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -18,9 +18,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Syntax check
-        run: python3 -m py_compile capybara.py gui.py
+        run: python -m py_compile capybara.py gui.py server.py
       - name: Unit tests
-        run: python3 capybara.test.py -v
+        run: python capybara.test.py -v
 
   shellcheck:
     runs-on: ubuntu-24.04

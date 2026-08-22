@@ -25,6 +25,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+IS_WINDOWS = sys.platform == "nt"
+EXE = ".exe" if IS_WINDOWS else ""
+
 VERSION = "1.0.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11434
@@ -34,6 +37,17 @@ DEFAULT_BATCH = 2048
 DEFAULT_UBATCH = 512
 HF_API = "https://huggingface.co/api/models"
 HF_RESOLVE = "https://huggingface.co/{repo}/resolve/main/{file}"
+OLLAMA_REGISTRY = "https://registry.ollama.ai"
+
+# Ollama registry layers (OCI media types).
+OLLAMA_MODEL_MT = "application/vnd.ollama.image.model"
+OLLAMA_SYSTEM_MT = "application/vnd.ollama.image.system"
+OLLAMA_PARAMS_MT = "application/vnd.ollama.image.params"
+OLLAMA_MANIFEST_ACCEPT = ", ".join([
+    "application/vnd.ollama.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+])
 
 SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 QUANT_SUFFIX_RE = re.compile(r"[-._](?:iq|q)\d[\w.\-]*$", re.IGNORECASE)
@@ -61,6 +75,7 @@ PARAM_MAP = {
     "repeat_penalty": "repeat_penalty",
     "seed": "seed",
     "num_predict": "max_tokens",
+    "stop": "stop",
 }
 
 
@@ -125,7 +140,7 @@ class Settings:
         if configured:
             candidates.append(Path(str(configured)).expanduser())
         home = Path(os.environ.get("CAPYBARA_HOME", str(Path.home() / ".capybara")))
-        candidates.append(home / "bin" / "llama-server")
+        candidates.append(home / "bin" / f"llama-server{EXE}")
         found = shutil.which("llama-server")
         if found:
             candidates.append(Path(found))
@@ -303,6 +318,18 @@ def clone_file(src: Path, dest: Path) -> None:
         shutil.copy2(src, dest)
 
 
+def require_free_space(dest: Path, needed: int) -> None:
+    """Refuse to fill the disk: die when free space < needed * 1.05."""
+    try:
+        free = shutil.disk_usage(dest).free
+    except OSError:
+        return
+    required = int(needed * 1.05)
+    if free < required:
+        die(f"not enough disk space for {dest.name}: need ~{human_size(required)}, "
+            f"only {human_size(free)} free - free up some space and retry")
+
+
 def list_models(settings: Settings) -> List[Path]:
     """All installed GGUF files, newest first."""
     settings.models.mkdir(parents=True, exist_ok=True)
@@ -360,6 +387,23 @@ def pull_model(settings: Settings, spec: str) -> Path:
         print(f"installed {dest}")
         return dest
 
+    ollama_ref = parse_ollama_ref(spec)
+    if ollama_ref is not None:
+        name, tag = ollama_ref
+        explicit = bool(re.match(r"^(?:ollama|ol)/", spec))
+        imported = import_ollama_local(settings, name, tag)
+        if imported:
+            return imported
+        try:
+            return pull_ollama_registry(settings, name, tag)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404 and explicit:
+                die(f"model '{name}:{tag}' not found in the Ollama registry")
+            if exc.code != 404:
+                die(f"Ollama registry lookup failed for {name}:{tag}: {exc}")
+        except urllib.error.URLError as exc:
+            die(f"Ollama registry unreachable ({exc.reason}) - check your connection")
+
     if parsed:
         repo, quant = parsed
         try:
@@ -382,8 +426,8 @@ def pull_model(settings: Settings, spec: str) -> Path:
         return settings.models / chosen[-1]
 
     known = ", ".join(sorted(ALIASES))
-    die(f"unknown model '{spec}' - use a local GGUF path, a URL, owner/repo[:quant], "
-        f"or an alias ({known})")
+    die(f"unknown model '{spec}' - use a local GGUF path, a URL, owner/repo[:quant],\n"
+        f"any Ollama library model (e.g. gemma3:4b, ollama/phi4), or an alias ({known})")
 
 
 def hf_spec_local_files(settings: Settings, spec: str) -> List[Path]:
@@ -409,6 +453,175 @@ def resolve_model_or_alias(settings: Settings, name: str) -> Optional[Path]:
         if files:
             return files[-1]
     return None
+
+
+def parse_ollama_ref(spec: str) -> Optional[Tuple[str, str]]:
+    """Split an Ollama-style ref into (name, tag).
+
+    Accepts explicit 'ollama/name[:tag]' / 'ol/name[:tag]' prefixes and any
+    bare 'name[:tag]' without a slash (implicit registry candidates).
+    Returns None for URLs and owner/repo specs.
+    """
+    if spec.startswith(("http://", "https://")):
+        return None
+    explicit = re.match(r"^(?:ollama|ol)/([^/:]+)(?::(.+))?$", spec)
+    if explicit:
+        return explicit.group(1).lower(), explicit.group(2) or "latest"
+    if "/" in spec:
+        return None
+    name, _, tag = spec.partition(":")
+    if not name:
+        return None
+    return name.lower(), tag or "latest"
+
+
+def ollama_manifest(name: str, tag: str) -> Dict[str, Any]:
+    """Fetch an OCI manifest from the Ollama registry."""
+    url = f"{OLLAMA_REGISTRY}/v2/library/{name}/manifests/{tag}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "capybara",
+        "Accept": OLLAMA_MANIFEST_ACCEPT,
+    })
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def local_ollama_root(root: Optional[Path] = None) -> Optional[Path]:
+    """The models directory of a local Ollama installation, if present."""
+    if root is None:
+        env = os.environ.get("OLLAMA_MODELS")
+        root = Path(env).expanduser() if env else Path.home() / ".ollama" / "models"
+    return root if root.is_dir() else None
+
+
+def ollama_gguf_name(name: str, tag: str, parts: int = 1) -> List[str]:
+    """Local filename(s) for a pulled Ollama model; tags become suffixes,
+    multi-blob models get llama.cpp shard names so they load together."""
+    base = f"{name}-{tag}" if tag != "latest" else name
+    if parts == 1:
+        return [f"{base}.gguf"]
+    return [f"{base}-{i:05d}-of-{parts:05d}.gguf" for i in range(1, parts + 1)]
+
+
+def install_ollama_manifest(settings: Settings, name: str, tag: str,
+                            manifest: Dict[str, Any],
+                            fetch_blob, blob_text) -> Path:
+    """Install the GGUF blob(s) of an Ollama manifest plus its sidecar.
+
+    fetch_blob(digest, dest) materializes one layer;
+    blob_text(digest) returns small text layers (system/params).
+    """
+    settings.models.mkdir(parents=True, exist_ok=True)
+    layers = manifest.get("layers", [])
+    media_types = {l.get("mediaType") for l in layers}
+    model_layers = [l for l in layers if l.get("mediaType") == OLLAMA_MODEL_MT]
+    if not model_layers:
+        if "application/vnd.ollama.image.tensor" in media_types:
+            die(f"{name}:{tag} is not a GGUF model (MLX/safetensors build) - "
+                f"capybara only runs GGUF models")
+        die(f"{name}:{tag} contains no model data")
+    filenames = ollama_gguf_name(name, tag, len(model_layers))
+    dests: List[Path] = []
+    for filename, layer in zip(filenames, model_layers):
+        dest = settings.models / filename
+        size = int(layer.get("size") or 0)
+        if not (dest.exists() and dest.stat().st_size > 0):
+            if size:
+                require_free_space(dest, size)
+            fetch_blob(layer["digest"], dest)
+            with open(dest, "rb") as fh:
+                magic = fh.read(4)
+            if magic != b"GGUF":
+                dest.unlink(missing_ok=True)
+                die(f"{name}:{tag} is not a GGUF model "
+                    f"(unsupported format) - pick a GGUF variant")
+            print(f"installed {dest}")
+        else:
+            print(f"already installed {dest}")
+        dests.append(dest)
+    sidecar: Dict[str, Any] = {"template": None}
+    for layer in layers:
+        media = layer.get("mediaType")
+        digest = layer.get("digest")
+        if not digest:
+            continue
+        try:
+            text = blob_text(digest)
+        except OSError:
+            continue
+        if media == OLLAMA_SYSTEM_MT and text.strip():
+            sidecar["system"] = text
+        elif media == OLLAMA_PARAMS_MT:
+            try:
+                sidecar["params"] = {k: v for k, v in json.loads(text).items()
+                                     if k in PARAM_MAP}
+            except ValueError:
+                pass
+    if "system" in sidecar or sidecar.get("params"):
+        sidecar.update({"name": Path(filenames[0]).stem,
+                        "base": f"ollama:{name}:{tag}",
+                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        meta = settings.models / f"{Path(filenames[0]).stem}.capybara.json"
+        meta.write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
+    return dests[-1]
+
+
+def pull_ollama_registry(settings: Settings, name: str, tag: str) -> Path:
+    """Download a model straight from the Ollama registry."""
+    manifest = ollama_manifest(name, tag)
+
+    def fetch_blob(digest: str, dest: Path) -> None:
+        download_to(dest, f"{OLLAMA_REGISTRY}/v2/library/{name}/blobs/{digest}")
+
+    def blob_text(digest: str) -> str:
+        req = urllib.request.Request(
+            f"{OLLAMA_REGISTRY}/v2/library/{name}/blobs/{digest}",
+            headers={"User-Agent": "capybara"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    result = install_ollama_manifest(settings, name, tag, manifest,
+                                     fetch_blob, blob_text)
+    print(f"(from Ollama registry: {name}:{tag})")
+    return result
+
+
+def import_ollama_local(settings: Settings, name: str, tag: str,
+                        root: Optional[Path] = None) -> Optional[Path]:
+    """Import a model already pulled by a local Ollama install.
+
+    Blobs are hardlinked when possible, so this is instant and free.
+    Returns None when Ollama is absent or does not know the model.
+    """
+    source = local_ollama_root(root)
+    if source is None:
+        return None
+    mpath = (source / "manifests" / "registry.ollama.ai" /
+             "library" / name / tag)
+    if not mpath.is_file():
+        return None
+    try:
+        manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        die(f"unreadable Ollama manifest {mpath}: {exc}")
+
+    def blob_path(digest: str) -> Path:
+        return source / "blobs" / digest.replace(":", "-")
+
+    def fetch_blob(digest: str, dest: Path) -> None:
+        src = blob_path(digest)
+        if not src.is_file():
+            die(f"Ollama blob missing: {src}")
+        clone_file(src, dest)
+
+    def blob_text(digest: str) -> str:
+        path = blob_path(digest)
+        return path.read_text(encoding="utf-8", errors="replace")
+
+    result = install_ollama_manifest(settings, name, tag, manifest,
+                                     fetch_blob, blob_text)
+    print(f"(imported from local Ollama at {source})")
+    return result
 
 
 def sidecar_for(model: Path) -> Optional[Dict[str, Any]]:
@@ -492,10 +705,17 @@ def server_state(settings: Settings) -> Optional[Dict[str, Any]]:
 def process_comm(pid: int) -> str:
     """Return the command name of a pid ('' when it does not exist)."""
     try:
+        if IS_WINDOWS:
+            # os.kill(pid, 0) terminates on Windows, so probe via tasklist.
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10)
+            line = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
+            return line.split('","')[0].strip('"') if line.startswith('"') else ""
         out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="],
                              capture_output=True, text=True, timeout=5)
         return out.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, IndexError):
         return ""
 
 
@@ -556,6 +776,7 @@ def stop_server(settings: Settings) -> None:
     """Terminate the gateway (and its engine child) and clear state."""
     state = server_state(settings)
     stopped_any = False
+    sig_kill = signal.SIGTERM if IS_WINDOWS else signal.SIGKILL
     for key, needles in (("gateway_pid", ("python", "capybara")),
                          ("pid", ("llama-server",))):
         pid = state.get(key) if state else None
@@ -566,18 +787,17 @@ def stop_server(settings: Settings) -> None:
         try:
             os.kill(pid, signal.SIGTERM)
             stopped_any = True
-        except ProcessLookupError:
+        except OSError:
             pass
         for _ in range(50):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            # os.kill(pid, 0) kills on Windows - probe the name instead.
+            if not process_comm(pid):
                 break
             time.sleep(0.1)
         else:
             try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
+                os.kill(pid, sig_kill)
+            except OSError:
                 pass
     (settings.run_dir / "server.pid").unlink(missing_ok=True)
     settings.state_file.unlink(missing_ok=True)
@@ -613,13 +833,19 @@ def spawn_gateway(settings: Settings, model_name: str) -> subprocess.Popen:
     settings.run_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["CAPYBARA_MODEL"] = model_name
-    with open(settings.run_dir / "gateway.log", "ab") as log:
-        proc = subprocess.Popen(
-            [sys.executable, str(settings.server_py), "--model", model_name],
-            stdout=log, stderr=log,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+    log = open(settings.run_dir / "gateway.log", "ab")
+    popen_kwargs: Dict[str, Any] = {"stdout": log, "stderr": log,
+                                    "stdin": subprocess.DEVNULL}
+    if IS_WINDOWS:
+        # No setsid on Windows; detach + new group keeps the daemon alive
+        # after the CLI returns and avoids console windows popping up.
+        popen_kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                         | subprocess.DETACHED_PROCESS)
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(
+        [sys.executable, str(settings.server_py), "--model", model_name],
+        **popen_kwargs)
     (settings.run_dir / "server.pid").write_text(str(proc.pid))
     return proc
 
@@ -636,18 +862,28 @@ def start_server(settings: Settings, model: Path, foreground: bool = False,
             f"free it or pick another public port (CAPYBARA_PORT)")
 
     if foreground:
-        # Replace this process with the gateway so signals (Ctrl-C, TERM)
-        # reach the supervisor itself, which owns the engine child cleanup.
-        env = os.environ.copy()
-        env["CAPYBARA_MODEL"] = model.name
         print(f"Capybara {VERSION} starting in foreground - press Ctrl-C to stop")
         sys.stdout.flush()
+        env = os.environ.copy()
+        env["CAPYBARA_MODEL"] = model.name
         try:
-            os.execve(sys.executable,
-                      [sys.executable, str(settings.server_py), "--model", model.name],
-                      env)
+            if IS_WINDOWS:
+                # exec* does not replace processes on Windows; run attached.
+                proc = subprocess.Popen(
+                    [sys.executable, str(settings.server_py),
+                     "--model", model.name])
+                proc.wait()
+            else:
+                # Replace this process so signals (Ctrl-C, TERM) reach the
+                # supervisor itself, which owns the engine child cleanup.
+                os.execve(sys.executable,
+                          [sys.executable, str(settings.server_py),
+                           "--model", model.name],
+                          env)
+        except KeyboardInterrupt:
+            pass
         finally:
-            settings.state_file.unlink(missing_ok=True)  # only on exec failure
+            settings.state_file.unlink(missing_ok=True)
         return
 
     proc = spawn_gateway(settings, model.name)
@@ -1000,9 +1236,13 @@ def open_ui(settings: Settings, model: Optional[Path] = None) -> None:
         "WEBUI_AUTH": "false",
     })
     with open(log_path / "webui.log", "ab") as log:
+        popen_kwargs: Dict[str, Any] = {"stdout": log, "stderr": log}
+        if IS_WINDOWS:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
         proc = subprocess.Popen([launcher, "serve", "--port", str(settings.webui_port)],
-                                stdout=log, stderr=log,
-                                start_new_session=True)
+                                **popen_kwargs)
     print(f"starting Open WebUI (pid {proc.pid}) - first boot can take a minute...")
     deadline = time.time() + 180
     while time.time() < deadline:

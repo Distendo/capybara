@@ -351,6 +351,122 @@ class GatewaySidecarTests(unittest.TestCase):
             self.assertEqual(out["messages"][0]["content"], "client wins")
 
 
+class OllamaRefTests(unittest.TestCase):
+    def test_parse_ollama_ref(self):
+        cases = {
+            "llama3.2": ("llama3.2", "latest"),
+            "gemma3:4b": ("gemma3", "4b"),
+            "ollama/phi4": ("phi4", "latest"),
+            "ol/qwen2.5:7b-instruct-q4_K_M": ("qwen2.5", "7b-instruct-q4_K_M"),
+        }
+        for spec, expected in cases.items():
+            self.assertEqual(capybara.parse_ollama_ref(spec), expected, spec)
+        for spec in ("http://x/y.gguf", "https://x/y.gguf",
+                     "owner/repo", "owner/repo:Q4_K_M"):
+            self.assertIsNone(capybara.parse_ollama_ref(spec), spec)
+
+    def test_gguf_names(self):
+        self.assertEqual(capybara.ollama_gguf_name("llama3.2", "latest"),
+                         ["llama3.2.gguf"])
+        self.assertEqual(capybara.ollama_gguf_name("gemma3", "4b"),
+                         ["gemma3-4b.gguf"])
+        self.assertEqual(
+            capybara.ollama_gguf_name("bigmodel", "latest", 2),
+            ["bigmodel-00001-of-00002.gguf", "bigmodel-00002-of-00002.gguf"])
+
+
+class OllamaInstallTests(unittest.TestCase):
+    MANIFEST = {
+        "layers": [
+            {"mediaType": capybara.OLLAMA_SYSTEM_MT,
+             "digest": "sha256:sys", "size": 10},
+            {"mediaType": capybara.OLLAMA_MODEL_MT,
+             "digest": "sha256:model", "size": 100},
+            {"mediaType": capybara.OLLAMA_PARAMS_MT,
+             "digest": "sha256:params", "size": 30},
+        ],
+    }
+
+    def _settings(self):
+        return capybara.Settings(Path(tempfile.mkdtemp()), {})
+
+    def test_install_writes_gguf_and_sidecar(self):
+        settings = self._settings()
+        blobs = {
+            "sha256:model": b"GGUF-fake",
+            "sha256:sys": b"You are terse.",
+            "sha256:params": json.dumps({"temperature": 0.5,
+                                         "num_gpu": 99, "stop": ["###"]}).encode(),
+        }
+
+        def fetch(digest, dest):
+            dest.write_bytes(blobs[digest])
+
+        def text(digest):
+            return blobs[digest].decode("utf-8")
+
+        result = capybara.install_ollama_manifest(
+            settings, "tiny", "1b", dict(self.MANIFEST), fetch, text)
+        self.assertEqual(result.name, "tiny-1b.gguf")
+        gguf = settings.models / "tiny-1b.gguf"
+        self.assertEqual(gguf.read_bytes(), b"GGUF-fake")
+        meta = json.loads((settings.models / "tiny-1b.capybara.json").read_text())
+        self.assertEqual(meta["system"], "You are terse.")
+        self.assertEqual(meta["params"], {"temperature": 0.5, "stop": ["###"]})
+        self.assertEqual(meta["base"], "ollama:tiny:1b")
+
+    def test_import_local_hardlinks_existing_blob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ollama_root = Path(tmp) / "models"
+            blob_dir = ollama_root / "blobs"
+            blob_dir.mkdir(parents=True)
+            (blob_dir / "sha256-abc").write_bytes(b"GGUF-data")
+            manifest_path = (ollama_root / "manifests" / "registry.ollama.ai"
+                             / "library" / "mini" / "latest")
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(json.dumps({
+                "layers": [{"mediaType": capybara.OLLAMA_MODEL_MT,
+                            "digest": "sha256:abc", "size": 9}]}))
+            settings = self._settings()
+            result = capybara.import_ollama_local(settings, "mini", "latest",
+                                                  root=ollama_root)
+            self.assertIsNotNone(result)
+            installed = settings.models / "mini.gguf"
+            self.assertEqual(installed.read_bytes(), b"GGUF-data")
+            # absent model returns None
+            self.assertIsNone(capybara.import_ollama_local(
+                settings, "nope", "latest", root=ollama_root))
+
+    def test_pull_model_prefers_local_ollama_then_registry(self):
+        settings = self._settings()
+        calls = []
+
+        def fake_import(s, name, tag, root=None):
+            calls.append(("local", name, tag))
+            return None
+
+        def fake_registry(s, name, tag):
+            calls.append(("registry", name, tag))
+            return s.models / f"{name}.gguf"
+
+        with mock.patch.object(capybara, "import_ollama_local", fake_import), \
+             mock.patch.object(capybara, "pull_ollama_registry", fake_registry):
+            result = capybara.pull_model(settings, "gemma3:4b")
+        self.assertEqual(calls, [("local", "gemma3", "4b"),
+                                 ("registry", "gemma3", "4b")])
+        self.assertEqual(result, settings.models / "gemma3.gguf")
+
+
+class DiskSpaceTests(unittest.TestCase):
+    def test_require_free_space_dies_when_disk_cannot_hold_blob(self):
+        dest = Path(tempfile.mkdtemp()) / "x.gguf"
+        capybara.require_free_space(dest, 1024)  # real disk: plenty
+        with mock.patch.object(capybara.shutil, "disk_usage",
+                               return_value=mock.Mock(free=100)):
+            with self.assertRaises(SystemExit):
+                capybara.require_free_space(dest, 10_000_000_000)
+
+
 class PortGuardTests(unittest.TestCase):
     def _settings(self, tmp: Path, port: int) -> capybara.Settings:
         return capybara.Settings(tmp, {"server": {"port": port}})
