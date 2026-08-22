@@ -52,7 +52,7 @@ if (( UTF8 )); then
 fi
 
 SPIN_PID=""
-FRAMES=('-' '\' '|' '/')
+FRAMES=("-" "\\" "|" "/")
 if (( UTF8 )); then
   # braille spinner built from raw UTF-8 bytes (bash 3.2 has no \u escapes)
   FRAMES=("$(printf '\342\240\213')" "$(printf '\342\240\231')" \
@@ -61,7 +61,10 @@ if (( UTF8 )); then
           "$(printf '\342\241\246')" "$(printf '\342\241\247')")
 fi
 
-cleanup(){ spin_stop; [[ -n "$STAGE" ]] && rm -rf "$STAGE" || true; }
+cleanup(){
+  spin_stop
+  if [[ -n "$STAGE" ]]; then rm -rf "$STAGE"; fi
+}
 trap cleanup EXIT
 trap 'rc=$?; spin_stop; printf "\r%b[%s]%b unexpected failure at line %s (exit %s)\n" \
       "$T_RED" "$G_NO" "$T_0" "$LINENO" "$rc" >&2; exit "$rc"' ERR
@@ -118,7 +121,7 @@ spin_stop(){
     kill "$SPIN_PID" 2>/dev/null || true
     wait "$SPIN_PID" 2>/dev/null || true
     SPIN_PID=''
-    [[ -t 2 ]] && printf '\r     \r' >&2 || true
+    if [[ -t 2 ]]; then printf '\r     \r' >&2; fi
   fi
 }
 
