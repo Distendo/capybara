@@ -25,7 +25,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-IS_WINDOWS = sys.platform == "nt"
+IS_WINDOWS = os.name == "nt"
 EXE = ".exe" if IS_WINDOWS else ""
 
 VERSION = "1.0.0"
@@ -133,14 +133,14 @@ class Settings:
         self.log_file = self.run_dir / "server.log"
         self.state_file = self.run_dir / "server.json"
 
-    @staticmethod
-    def _resolve_engine(configured: Any) -> Path:
+    def _resolve_engine(self, configured: Any) -> Path:
         """Locate llama-server: config path > install dir > PATH."""
         candidates: List[Path] = []
         if configured:
             candidates.append(Path(str(configured)).expanduser())
-        home = Path(os.environ.get("CAPYBARA_HOME", str(Path.home() / ".capybara")))
-        candidates.append(home / "bin" / f"llama-server{EXE}")
+        # Use this Settings' own home - never probe the ambient environment,
+        # which may be scrubbed (tests, services) on any platform.
+        candidates.append(self.home / "bin" / f"llama-server{EXE}")
         found = shutil.which("llama-server")
         if found:
             candidates.append(Path(found))

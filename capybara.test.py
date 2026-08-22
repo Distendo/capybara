@@ -251,7 +251,7 @@ class EngineDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             custom = Path(tmp) / "custom-llama-server"
             custom.write_bytes(b"x")
-            resolved = capybara.Settings._resolve_engine(str(custom))
+            resolved = capybara.Settings(Path(tmp), {})._resolve_engine(str(custom))
             self.assertEqual(resolved, custom)
 
     def test_resolve_engine_should_fall_back_to_path_lookup(self):
@@ -260,18 +260,15 @@ class EngineDiscoveryTests(unittest.TestCase):
             fake.write_bytes(b"x")
             empty_home = Path(tmp) / "empty-home"
             empty_home.mkdir()
-            env = {"CAPYBARA_HOME": str(empty_home)}
-            with mock.patch.dict(os.environ, env, clear=False), \
-                 mock.patch("shutil.which", return_value=str(fake)):
-                resolved = capybara.Settings._resolve_engine(None)
+            with mock.patch("shutil.which", return_value=str(fake)):
+                resolved = capybara.Settings(empty_home, {})._resolve_engine(None)
             self.assertEqual(resolved, fake)
 
     def test_resolve_engine_should_default_to_home_bin(self):
         home = Path("/nonexistent-capybara-home-for-tests")
-        with mock.patch.dict(os.environ, {"CAPYBARA_HOME": str(home)}, clear=False), \
-             mock.patch("shutil.which", return_value=None):
-            resolved = capybara.Settings._resolve_engine(None)
-        self.assertEqual(resolved, home / "bin" / "llama-server")
+        with mock.patch("shutil.which", return_value=None):
+            resolved = capybara.Settings(home, {})._resolve_engine(None)
+        self.assertEqual(resolved, home / "bin" / f"llama-server{capybara.EXE}")
 
 
 class StateSafetyTests(unittest.TestCase):
