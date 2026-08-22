@@ -18,7 +18,14 @@ capybara run llama3
 ```
 
 Models run locally on your machine and can also be exposed through an
-OpenAI-compatible HTTP API.
+OpenAI-compatible HTTP API with a built-in web UI.
+
+### What makes it better
+
+- **Web UI included** — every server ships with a chat interface at `http://localhost:11434`. Streaming, markdown, conversation history, live model switching. No extensions.
+- **Hot-swapping models** — switch models through the UI, API or CLI without stopping the server. Requests queue until the swap finishes; clients never see an error.
+- **Fast installs** — signed prebuilt llama.cpp binaries for macOS/Linux when available; falls back to compiling for your exact backend otherwise.
+- **Honest process management** — PID reuse protection, orphan cleanup, foreign-port detection ("is Ollama running?") instead of cryptic failures.
 
 Under the hood Capybara drives [llama.cpp](https://github.com/ggml-org/llama.cpp)
 as its inference engine — you get state-of-the-art GGUF inference with Metal,
@@ -35,9 +42,12 @@ cd capybara
 make build        # or: ./install.sh
 ```
 
-The installer detects your hardware, builds the right llama.cpp backend,
-and installs `capybara` / `capybara-gui` to `~/.local/bin`.
+The installer prefers official prebuilt llama.cpp binaries for your platform
+(seconds, not minutes) and only compiles from source when no prebuilt binary
+matches your hardware (e.g. CUDA/ROCm/SYCL). It then installs `capybara` /
+`capybara-gui` to `~/.local/bin`.
 
+Force a source build of the engine: `CAPYBARA_ENGINE_SOURCE=1 ./install.sh`.
 Only need the engine? `make engine` skips CLI setup.
 
 ## Usage
@@ -51,6 +61,7 @@ Only need the engine? `make engine` skips CLI setup.
 | `capybara rm <model>` | remove a model |
 | `capybara cp <src> <dst>` | copy a model under a new name |
 | `capybara serve [--model M] [-F]` | start the API server (`-F` = foreground) |
+| `capybara ui [--model M]` | start the server and open the Web UI in your browser |
 | `capybara ps` | server status |
 | `capybara stop` | stop the API server |
 | `capybara logs [-n N]` | tail the engine log |
@@ -58,6 +69,14 @@ Only need the engine? `make engine` skips CLI setup.
 | `capybara launch <prog> --model M` | run a program wired to the local API |
 
 Running a model that isn't installed pulls it automatically first.
+
+One-shot runs print generation stats:
+
+```
+$ capybara run smollm "hi"
+Hello! How can I assist you today?
+[8 tokens · 0.3s, first token 0.1s · 26.7 tok/s]
+```
 
 ### Chat commands
 
@@ -104,6 +123,21 @@ NAME                      SIZE      MODIFIED
 SmolLM2-135M-Instruct.Q2_K  84.2 MB  2026-08-22 12:40
 ```
 
+## Web UI
+
+Every server ships with a full chat interface — no extensions, no build step:
+
+```
+capybara ui            # start server + open browser
+```
+
+or just visit `http://localhost:11434` while the server runs.
+
+Features: streaming responses with live token stats, markdown + code blocks
+with copy buttons, conversation sidebar (stored in your browser), settings for
+system prompt / temperature / top_p / max tokens, model switcher with hot-swap,
+server status indicator.
+
 ## API
 
 Capybara serves an OpenAI-compatible API on:
@@ -129,7 +163,14 @@ curl http://localhost:11434/v1/chat/completions \
 ```
 
 It can therefore be used with applications that already support
-OpenAI-compatible endpoints.
+OpenAI-compatible endpoints. The same port also exposes management endpoints
+used by the Web UI:
+
+```
+GET  /api/status   server + engine state, uptime, current model
+GET  /api/models   installed models (loaded flag)
+POST /api/use      {"model": "name"} - hot-swap the loaded model
+```
 
 ### Python
 
@@ -215,27 +256,31 @@ CPU           (fallback, always available)
 
 ## Architecture
 
-Capybara separates the command line interface, API, model management and
-inference backend.
+Capybara separates the command line interface, gateway API, model management
+and inference backend.
 
 ```
                  Capybara
                     │
           ┌─────────┴─────────┐
           │                   │
-         CLI                GUI/API
+         CLI              Web UI (static)
           │                   │
           └─────────┬─────────┘
                     │
-              Model Manager
+             Gateway  :11434   ← public port, OpenAI-compatible + /api/*
+                    │  spawns/owns/hot-swaps ↓
+           Runtime (llama-server)  :11435   ← internal port
                     │
-               Runtime (llama-server)
-                    │
-             Backend Layer
+              Backend Layer
           ┌─────────┼─────────┐
           │         │         │
         Metal     CUDA      CPU
 ```
+
+The public port never restarts: switching models swaps the internal engine
+process underneath a live gateway. Existing clients keep their connection
+settings; in-flight requests are drained before the swap.
 
 This makes it possible to add different inference backends without changing
 the public interface.
@@ -245,9 +290,11 @@ the public interface.
 ```
 capybara/
 ├── capybara.py        # single-file CLI: model manager + runtime controller
+├── server.py          # gateway: OpenAI proxy, hot-swap, management API, Web UI host
+├── ui/index.html      # self-contained web chat interface
 ├── capybara.test.py   # unit tests (stdlib unittest, no dependencies)
-├── gui.py             # tkinter desktop companion
-├── install.sh         # backend detection + llama.cpp build + install
+├── gui.py             # desktop launcher (opens capybara ui)
+├── install.sh         # engine install (prebuilt-first) + CLI setup
 ├── Makefile           # make build / test / dev / engine
 └── .github/
     └── workflows/ci.yml
@@ -286,10 +333,11 @@ make dev ARGS="list"
 
 ## Status
 
-Capybara is a working prototype: pulling, running, serving and Modelfiles all
-work today. Expect rough edges; interfaces may still change before 1.0.
+Capybara v1.0: pulling, running, serving, Modelfiles, the Web UI and hot
+model switching all work today. Interfaces are stable within 1.x.
 
-Windows is not supported yet.
+Windows is supported through prebuilt CPU binaries; CUDA/ROCm on Windows
+require a source build (`CAPYBARA_ENGINE_SOURCE=1`).
 
 ## License
 

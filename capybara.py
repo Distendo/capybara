@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Capybara - a local model runner with an OpenAI-compatible API.
+"""Capybara - a local model runner with an OpenAI-compatible API and web UI.
 
-The CLI manages GGUF models (pull/list/rm/inspect), runs interactive chat
-sessions and drives a llama.cpp `llama-server` process that exposes both a
-native API and an OpenAI-compatible `/v1` endpoint.
+The CLI manages GGUF models (pull/list/rm/create/search), runs interactive
+chat sessions and supervises a llama.cpp `llama-server` process behind a
+gateway that serves the built-in chat UI plus an OpenAI-compatible `/v1`
+endpoint on one public port.
 
 Only the Python standard library is used.
 """
@@ -24,7 +25,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.3.0"
+VERSION = "1.0.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11434
 DEFAULT_CONTEXT = 10240
@@ -109,9 +110,31 @@ class Settings:
         self.gpu_layers = int(gpu_layers)
         self.bin_dir = home / "bin"
         self.run_dir = home / "run"
-        self.server_bin = self.bin_dir / "llama-server"
+        self.server_bin = self._resolve_engine(pick(
+            "CAPYBARA_ENGINE", "runtime", "engine", default=None))
         self.log_file = self.run_dir / "server.log"
         self.state_file = self.run_dir / "server.json"
+
+    @staticmethod
+    def _resolve_engine(configured: Any) -> Path:
+        """Locate llama-server: config path > install dir > PATH."""
+        candidates: List[Path] = []
+        if configured:
+            candidates.append(Path(str(configured)).expanduser())
+        home = Path(os.environ.get("CAPYBARA_HOME", str(Path.home() / ".capybara")))
+        candidates.append(home / "bin" / "llama-server")
+        found = shutil.which("llama-server")
+        if found:
+            candidates.append(Path(found))
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        return candidates[0]
+
+    @property
+    def engine_port(self) -> int:
+        """Internal port the engine binds to (gateway owns the public one)."""
+        return self.port + 1
 
     @property
     def base_url(self) -> str:
@@ -122,6 +145,15 @@ class Settings:
     def openai_url(self) -> str:
         """OpenAI-compatible endpoint exposed by llama-server."""
         return f"{self.base_url}/v1"
+
+    @property
+    def server_py(self) -> Path:
+        """Location of the gateway module that accompanies this CLI."""
+        here = Path(__file__).resolve().parent
+        for cand in (here / "server.py", self.home / "server.py"):
+            if cand.exists():
+                return cand
+        return here / "server.py"
 
 
 def parse_scalar(raw: str) -> Any:
@@ -444,7 +476,7 @@ def request_context(model: Path) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
 
 
 def server_state(settings: Settings) -> Optional[Dict[str, Any]]:
-    """Read the state file describing the managed server process."""
+    """Read the state file describing the managed gateway/engine processes."""
     if not settings.state_file.exists():
         return None
     try:
@@ -454,8 +486,40 @@ def server_state(settings: Settings) -> Optional[Dict[str, Any]]:
         return None
 
 
+def process_comm(pid: int) -> str:
+    """Return the command name of a pid ('' when it does not exist)."""
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def process_matches(pid: int, *needles: str) -> bool:
+    """True when a pid is alive and its command contains one of the needles.
+
+    Protects against killing an innocent process whose numeric id was
+    recycled after Capybara crashed without cleaning up.
+    """
+    comm = process_comm(pid)
+    low = comm.lower()
+    return bool(comm) and any(n in low for n in needles)
+
+
+def state_is_ours(settings: Settings, state: Optional[Dict[str, Any]] = None) -> bool:
+    """True when the recorded gateway process is still alive and is ours."""
+    state = state or server_state(settings)
+    if not state:
+        return False
+    pid = state.get("gateway_pid") or state.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    return process_matches(pid, "python", "capybara")
+
+
 def server_ready(settings: Settings, timeout: float = 2.0) -> bool:
-    """True when the managed server answers /health with HTTP 200."""
+    """True when the managed gateway answers /health with HTTP 200."""
     try:
         req = urllib.request.Request(f"{settings.base_url}/health")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -464,107 +528,183 @@ def server_ready(settings: Settings, timeout: float = 2.0) -> bool:
         return False
 
 
-def stop_server(settings: Settings) -> None:
-    """Terminate the managed server process and clear its state."""
-    state = server_state(settings)
-    pid_file = settings.run_dir / "server.pid"
-    pid = None
-    if state and state.get("pid"):
-        pid = int(state["pid"])
-    elif pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-        except ValueError:
-            pid = None
-    if pid is None:
-        print("Capybara is not running")
+def port_has_listener(settings: Settings, port: Optional[int] = None) -> bool:
+    """True when anything accepts TCP connections on host:port."""
+    import socket
+    target = settings.port if port is None else port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((settings.host, target)) == 0
+
+
+def foreign_port_guard(settings: Settings) -> None:
+    """Die with a clear message when the port is held by another program."""
+    if not port_has_listener(settings):
         return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    for _ in range(40):
+    if server_ready(settings) and state_is_ours(settings):
+        return
+    die(f"port {settings.port} is already used by another program "
+        f"(is Ollama or an old Capybara running?).\n"
+        f"Stop it or choose another port, e.g.:\n"
+        f"  export CAPYBARA_PORT=11440")
+
+
+def stop_server(settings: Settings) -> None:
+    """Terminate the gateway (and its engine child) and clear state."""
+    state = server_state(settings)
+    stopped_any = False
+    for key, needles in (("gateway_pid", ("python", "capybara")),
+                         ("pid", ("llama-server",))):
+        pid = state.get(key) if state else None
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        if not process_matches(pid, *needles):
+            continue  # stale entry pointing at an unrelated process
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.1)
-    else:
-        try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, signal.SIGTERM)
+            stopped_any = True
         except ProcessLookupError:
             pass
-    pid_file.unlink(missing_ok=True)
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    (settings.run_dir / "server.pid").unlink(missing_ok=True)
     settings.state_file.unlink(missing_ok=True)
-    print("Capybara stopped")
+    if not stopped_any:
+        print("Capybara is not running")
+    else:
+        print("Capybara stopped")
+
+
+def wait_until_ready(settings: Settings, proc: subprocess.Popen,
+                     seconds: float = 180.0) -> None:
+    """Block until the freshly spawned gateway serves /health."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        if server_ready(settings, timeout=1.0):
+            time.sleep(0.3)
+            return
+        time.sleep(0.25)
+    tail = ""
+    gw_log = settings.run_dir / "gateway.log"
+    for log in (gw_log, settings.log_file):
+        if log.exists():
+            lines = log.read_text(errors="replace").splitlines()
+            tail += "\n".join(lines[-10:]) + "\n"
+    stop_server(settings)
+    die(f"server failed to start; see {gw_log} / {settings.log_file}\n{tail}")
+
+
+def spawn_gateway(settings: Settings, model_name: str) -> subprocess.Popen:
+    """Launch the gateway as a detached daemon and remember its handle."""
+    settings.run_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["CAPYBARA_MODEL"] = model_name
+    with open(settings.run_dir / "gateway.log", "ab") as log:
+        proc = subprocess.Popen(
+            [sys.executable, str(settings.server_py), "--model", model_name],
+            stdout=log, stderr=log,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    (settings.run_dir / "server.pid").write_text(str(proc.pid))
+    return proc
 
 
 def start_server(settings: Settings, model: Path, foreground: bool = False,
                  extra_args: Optional[List[str]] = None) -> None:
-    """Start llama-server for model, restarting it if another model is loaded."""
+    """Start the full stack (gateway + engine) serving `model`."""
+    del extra_args  # engine tuning lives in config.yaml since v1.0
     if not settings.server_bin.exists():
         die(f"engine not found at {settings.server_bin} - run ./install.sh first")
-    state = server_state(settings)
-    loaded = state.get("model") if state else None
-    if server_ready(settings) and loaded == model.name:
-        return
-    if server_ready(settings):
-        stop_server(settings)
-    settings.run_dir.mkdir(parents=True, exist_ok=True)
-
-    meta = sidecar_for(model) or {}
-    ctx = int((meta.get("params") or {}).get("num_ctx", settings.context))
-    cmd = [
-        str(settings.server_bin),
-        "--model", str(model),
-        "--host", settings.host,
-        "--port", str(settings.port),
-        "--threads", str(settings.threads),
-        "--ctx-size", str(ctx),
-        "--batch-size", str(settings.batch),
-        "--ubatch-size", str(settings.ubatch),
-        "--n-gpu-layers", str(settings.gpu_layers),
-        "--parallel", "1",
-        "--cont-batching",
-        "--flash-attn", "on",
-    ]
-    if extra_args:
-        cmd.extend(extra_args)
+    foreign_port_guard(settings)
+    if port_has_listener(settings, settings.engine_port):
+        die(f"internal engine port {settings.engine_port} is already in use - "
+            f"free it or pick another public port (CAPYBARA_PORT)")
 
     if foreground:
-        print(f"Capybara serving {model.name} on {settings.base_url} (Ctrl-C to stop)")
+        # Replace this process with the gateway so signals (Ctrl-C, TERM)
+        # reach the supervisor itself, which owns the engine child cleanup.
+        env = os.environ.copy()
+        env["CAPYBARA_MODEL"] = model.name
+        print(f"Capybara {VERSION} starting in foreground - press Ctrl-C to stop")
+        sys.stdout.flush()
         try:
-            subprocess.run(cmd, check=False)
+            os.execve(sys.executable,
+                      [sys.executable, str(settings.server_py), "--model", model.name],
+                      env)
         finally:
-            settings.state_file.unlink(missing_ok=True)
+            settings.state_file.unlink(missing_ok=True)  # only on exec failure
         return
 
-    with open(settings.log_file, "ab") as log:
-        proc = subprocess.Popen(cmd, stdout=log, stderr=log)
-    (settings.run_dir / "server.pid").write_text(str(proc.pid))
-    for _ in range(120):
-        if server_ready(settings, timeout=1.0):
-            settings.state_file.write_text(json.dumps({
-                "pid": proc.pid,
-                "model": model.name,
-                "host": settings.host,
-                "port": settings.port,
-                "started_at": time.time(),
-            }))
+    proc = spawn_gateway(settings, model.name)
+    wait_until_ready(settings, proc)
+
+
+def hot_swap(settings: Settings, model: Path) -> bool:
+    """Ask a running gateway to load another model; True on success."""
+    payload = json.dumps({"model": model.name}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{settings.base_url}/api/use", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return bool(data.get("ok"))
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+        return False
+
+
+def ensure_server(settings: Settings, model: Path) -> None:
+    """Make sure the public endpoint serves exactly this model."""
+    state = server_state(settings)
+    loaded = state.get("model") if state else None
+    if server_ready(settings) and state_is_ours(settings, state):
+        if loaded == model.name:
             return
-        if proc.poll() is not None:
-            break
-        time.sleep(0.25)
-    tail = ""
-    if settings.log_file.exists():
-        lines = settings.log_file.read_text(errors="replace").splitlines()
-        tail = "\n".join(lines[-10:])
-    stop_server(settings)
-    die(f"server failed to start; see {settings.log_file}\n{tail}")
+        print(f"switching model: {loaded} -> {model.name}")
+        if hot_swap(settings, model):
+            return
+        # swap failed mid-flight: fall through to a full restart
+        stop_server(settings)
+    start_server(settings, model)
 
 
-def stream_chat_completions(settings: Settings, payload: Dict[str, Any]) -> str:
-    """POST to /v1/chat/completions streaming deltas to stdout; returns text."""
+def trim_history(history: List[Dict[str, str]], max_chars: int) -> List[Dict[str, str]]:
+    """Drop the oldest turns so the prompt stays inside the context window.
+
+    System messages are always preserved; everything else is removed oldest
+    first until the serialized conversation fits within max_chars.
+    """
+    def size(msgs: List[Dict[str, str]]) -> int:
+        return sum(len(m.get("content", "")) for m in msgs) + 4 * len(msgs)
+
+    if size(history) <= max_chars:
+        return history
+    system = [m for m in history if m.get("role") == "system"]
+    rest = [m for m in history if m.get("role") != "system"]
+    while rest and size(system + rest) > max_chars:
+        rest = rest[1:]
+    # avoid ending on an orphan user message pair boundary issues: fine as-is
+    return system + rest
+
+
+def stream_chat_completions(settings: Settings,
+                            payload: Dict[str, Any]) -> Tuple[str, Dict[str, float]]:
+    """POST to /v1/chat/completions streaming deltas to stdout.
+
+    Returns the full text plus timing statistics (tokens, seconds, tok/s).
+    """
     req = urllib.request.Request(
         settings.openai_url + "/chat/completions",
         data=json.dumps({**payload, "stream": True}).encode("utf-8"),
@@ -572,7 +712,15 @@ def stream_chat_completions(settings: Settings, payload: Dict[str, Any]) -> str:
         method="POST",
     )
     chunks: List[str] = []
-    with urllib.request.urlopen(req, timeout=None) as resp:
+    tokens = 0
+    started = time.time()
+    first_token: Optional[float] = None
+    try:
+        resp = urllib.request.urlopen(req, timeout=None)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace").strip()
+        raise RuntimeError(f"HTTP {exc.code}: {body[:400]}") from exc
+    with resp:
         for raw in resp:
             line = raw.decode(errors="replace").strip()
             if not line.startswith("data:"):
@@ -581,14 +729,25 @@ def stream_chat_completions(settings: Settings, payload: Dict[str, Any]) -> str:
             if body == "[DONE]":
                 break
             try:
-                delta = json.loads(body)["choices"][0]["delta"].get("content") or ""
+                obj = json.loads(body)
+                delta = obj["choices"][0]["delta"].get("content") or ""
             except (KeyError, IndexError, ValueError):
                 continue
             if delta:
+                if first_token is None:
+                    first_token = time.time() - started
                 chunks.append(delta)
+                tokens += 1
                 print(delta, end="", flush=True)
-    print(flush=True)
-    return "".join(chunks)
+    elapsed = time.time() - started
+    text = "".join(chunks)
+    tps = tokens / elapsed if elapsed > 0 else 0.0
+    if tokens:
+        dim, reset = ("\033[2m", "\033[0m") if sys.stdout.isatty() else ("", "")
+        ttft = f", first token {first_token:.1f}s" if first_token else ""
+        print(f"{dim}\n[{tokens} tokens · {elapsed:.1f}s{ttft} · {tps:.1f} tok/s]{reset}",
+              flush=True)
+    return text, {"tokens": float(tokens), "seconds": elapsed, "tok_per_sec": tps}
 
 
 def chat_payload(model_name: str, history: List[Dict[str, str]],
@@ -597,15 +756,11 @@ def chat_payload(model_name: str, history: List[Dict[str, str]],
     return {"model": model_name, "messages": history, **params}
 
 
-def ensure_server(settings: Settings, model: Path) -> None:
-    """Make sure the server is running with exactly this model loaded."""
-    start_server(settings, model)
-
-
 def interactive_chat(settings: Settings, model: Path) -> None:
     """Run a REPL chat session against the given model."""
     system_msgs, params = request_context(model)
     history: List[Dict[str, str]] = list(system_msgs)
+    budget = max(1024, int(settings.context * 3.5))
     print(f"Capybara running {model.name}. Type /bye to exit, /clear to reset.")
     while True:
         try:
@@ -626,13 +781,18 @@ def interactive_chat(settings: Settings, model: Path) -> None:
         if not prompt:
             continue
         history.append({"role": "user", "content": prompt})
+        history = trim_history(history, budget)
         try:
-            reply = stream_chat_completions(
+            reply, _stats = stream_chat_completions(
                 settings, chat_payload(model.name, history, params))
             history.append({"role": "assistant", "content": reply})
         except SystemExit:
             raise
+        except RuntimeError as exc:
+            history.pop()  # drop the failed turn so the loop can continue
+            print(f"capybara: {exc}")
         except Exception as exc:
+            history.pop()
             print(f"capybara: {exc}")
 
 
@@ -728,17 +888,6 @@ def do_create(settings: Settings, name: str, modelfile: str) -> None:
     print(f"created {dest}")
 
 
-def do_ps(settings: Settings) -> None:
-    """Handle the 'ps' command."""
-    state = server_state(settings)
-    if not server_ready(settings) or not state:
-        print("STOPPED")
-        return
-    uptime = time.time() - float(state.get("started_at", time.time()))
-    print(f"RUNNING  model={state.get('model')}  pid={state.get('pid')}  "
-          f"url={settings.base_url}  uptime={int(uptime)}s")
-
-
 def do_logs(settings: Settings, lines: int) -> None:
     """Handle the 'logs' command."""
     if not settings.log_file.exists():
@@ -757,11 +906,49 @@ def do_serve(settings: Settings, args: argparse.Namespace) -> None:
         if not installed:
             die("no models installed - try: capybara pull smollm")
         model = installed[0]
-    start_server(settings, model, foreground=args.foreground)
+    state = server_state(settings)
+    already_up = server_ready(settings) and state_is_ours(settings, state)
+    if already_up and not args.foreground:
+        if state.get("model") != model.name:
+            print(f"switching model: {state.get('model')} -> {model.name}")
+            hot_swap(settings, model)
+    else:
+        start_server(settings, model, foreground=args.foreground)
     if not args.foreground:
         print(f"Capybara serving {model.name}")
+        print(f"Web UI:     http://{settings.host}:{settings.port}/")
         print(f"OpenAI API: {settings.openai_url}/chat/completions")
-        print(f"Health:     {settings.base_url}/health")
+
+
+def do_ps(settings: Settings) -> None:
+    """Handle the 'ps' command."""
+    state = server_state(settings)
+    if not state or not server_ready(settings) or not state_is_ours(settings, state):
+        print("STOPPED")
+        return
+    uptime = time.time() - float(state.get("started_at", time.time()))
+    print(f"RUNNING  mode={state.get('mode', 'gateway')}  "
+          f"model={state.get('model')}  "
+          f"url=http://{state.get('host')}:{state.get('port')}  "
+          f"engine_pid={state.get('pid')}  uptime={int(uptime)}s")
+
+
+def open_ui(settings: Settings, model: Optional[Path] = None) -> None:
+    """Make sure the server is up, then open the web UI in a browser."""
+    import webbrowser
+    if model is None:
+        model = resolve_model(settings, os.environ.get("CAPYBARA_MODEL", ""))
+    if model is None:
+        installed = list_models(settings)
+        if not installed:
+            die("no models installed - try: capybara pull smollm")
+        model = installed[0]
+    state = server_state(settings)
+    if not (server_ready(settings) and state_is_ours(settings, state)):
+        start_server(settings, model)
+    url = f"http://{settings.host}:{settings.port}/"
+    print(f"Capybara UI: {url}")
+    webbrowser.open(url)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -770,10 +957,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"Capybara {VERSION}")
     sub = parser.add_subparsers(dest="cmd")
 
-    serve = sub.add_parser("serve", help="start the API server")
+    serve = sub.add_parser("serve", help="start Capybara (web UI + OpenAI API)")
     serve.add_argument("--model", help="model to load")
     serve.add_argument("-F", "--foreground", action="store_true",
-                       help="run the engine in the foreground")
+                       help="run attached to this terminal instead of daemonizing")
+
+    sub.add_parser("ui", help="open the web UI in a browser")
 
     run = sub.add_parser("run", help="run a model (interactive chat or one-shot)")
     run.add_argument("model")
@@ -801,8 +990,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("name")
 
     sub.add_parser("ps", help="show server status")
-    sub.add_parser("stop", help="stop the API server")
-    sub.add_parser("serve-status", help=argparse.SUPPRESS)
+    sub.add_parser("stop", help="stop the server")
 
     logs = sub.add_parser("logs", help="show engine logs")
     logs.add_argument("-n", type=int, default=50, help="number of lines (default 50)")
@@ -832,6 +1020,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"Capybara {VERSION}")
     elif args.cmd == "serve":
         do_serve(settings, args)
+    elif args.cmd == "ui":
+        open_ui(settings)
     elif args.cmd == "run":
         model = resolve_model_or_alias(settings, args.model)
         if model is None:

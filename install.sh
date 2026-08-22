@@ -36,7 +36,7 @@ install_deps(){
         sudo apt-get update
         sudo apt-get install -y git cmake ninja-build build-essential pkg-config python3 python3-tk curl jq
       elif has dnf; then
-        sudo dnf install -y git cmake ninja-build gcc gcc-c++ make pkgconf-pkg-config python3 python3-tkinter curl jq
+        sudo dnf install -y git cmake ninja-build gcc gcc-c++ make pkgconf-pkg-config python3 python3-tk curl jq
       elif has pacman; then
         sudo pacman -Sy --needed --noconfirm git cmake ninja base-devel pkgconf python tk curl jq
       elif has zypper; then
@@ -62,13 +62,102 @@ detect_backend(){
   if has vulkaninfo; then BACKEND=vulkan; GPU="Vulkan"; return; fi
 }
 
-install_engine(){
+# ---------------------------------------------------------------------------
+# Prebuilt engine: llama.cpp publishes ready-to-run binaries for common
+# platforms. Downloading one takes ~30 seconds instead of a ~10 min compile.
+# ---------------------------------------------------------------------------
+latest_tag(){
+  local json tag=""
+  if has jq; then
+    tag="$(curl -fsSL --max-time 20 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=1' \
+      | jq -r '.[0].tag_name // empty')" || true
+  else
+    json="$(curl -fsSL --max-time 20 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=1')" || true
+    tag="$(printf '%s' "$json" | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed 's/.*"tag_name": *"//;s/"$//')"
+  fi
+  printf '%s' "$tag"
+}
+
+prebuilt_asset(){
+  # $1 = release tag; echoes the asset filename or nothing when unavailable.
+  local t="$1"
+  case "${OS_NAME}:${ARCH}:${BACKEND}" in
+    macOS:arm64:*)          echo "llama-${t}-bin-macos-arm64.tar.gz";;
+    macOS:x86_64:*)         echo "llama-${t}-bin-macos-x64.tar.gz";;
+    Linux:x86_64:vulkan)    echo "llama-${t}-bin-ubuntu-vulkan-x64.tar.gz";;
+    Linux:x86_64:cpu)       echo "llama-${t}-bin-ubuntu-x64.tar.gz";;
+    Linux:aarch64:cpu)      echo "llama-${t}-bin-ubuntu-arm64.tar.gz";;
+    *)                      :;;  # cuda/rocm/sycl need a tailored source build
+  esac
+}
+
+verify_engine(){
+  # The engine must run standalone (dylib rpaths are self-contained).
+  if "$BIN/llama-server" --version >/dev/null 2>&1; then
+    return 0
+  fi
+  say "Prebuilt engine failed to start on this machine"
+  rm -f "$BIN/llama-server" "$BIN"/libggml*.dylib "$BIN"/libggml*.so* \
+        "$BIN"/libllama*.dylib "$BIN"/libllama*.so* "$BIN"/libmtmd*.dylib "$BIN"/libmtmd*.so*
+  return 1
+}
+
+try_prebuilt_engine(){
+  if ! has curl; then
+    say "curl not found; cannot download prebuilt engine"
+    return 1
+  fi
+  local tag asset url stage srcdir
+  tag="$(latest_tag)"
+  if [[ -z "$tag" ]]; then
+    say "Could not resolve latest llama.cpp release"
+    return 1
+  fi
+  asset="$(prebuilt_asset "$tag")"
+  if [[ -z "$asset" ]]; then
+    say "No prebuilt engine for $OS_NAME/$ARCH/$BACKEND - building from source"
+    return 1
+  fi
+  url="https://github.com/ggml-org/llama.cpp/releases/download/${tag}/${asset}"
+  stage="$(mktemp -d)"
+  say "Downloading prebuilt llama.cpp ${asset}"
+  if ! curl -fL --retry 4 --retry-delay 2 --progress-bar -o "$stage/engine.tar.gz" "$url"; then
+    say "Download failed (${url})"
+    rm -rf "$stage"
+    return 1
+  fi
+  mkdir -p "$stage/unpacked"
+  if ! tar xzf "$stage/engine.tar.gz" -C "$stage/unpacked"; then
+    say "Extraction failed"
+    rm -rf "$stage"
+    return 1
+  fi
+  srcdir="$(find "$stage/unpacked" -maxdepth 1 -type d -name 'llama-*' | head -n1)"
+  if [[ -z "$srcdir" || ! -x "$srcdir/llama-server" ]]; then
+    say "Unexpected archive layout"
+    rm -rf "$stage"
+    return 1
+  fi
+  cp "$srcdir/llama-server" "$BIN/llama-server"
+  chmod +x "$BIN/llama-server"
+  if [[ -x "$srcdir/llama-cli" ]]; then
+    cp "$srcdir/llama-cli" "$BIN/llama-cli"
+    chmod +x "$BIN/llama-cli"
+  fi
+  # Shared libraries live next to the binaries (@loader_path / $ORIGIN rpath).
+  find "$srcdir" -maxdepth 1 \( -name 'lib*.dylib' -o -name 'lib*.so*' \) \
+    -exec cp {} "$BIN/" \;
+  rm -rf "$stage"
+  verify_engine
+}
+
+install_engine_source(){
   if [[ -d "$SRC/.git" ]]; then
     say "Updating llama.cpp"
     git -C "$SRC" fetch --depth=1 origin master >/dev/null 2>&1 || true
     git -C "$SRC" reset --hard origin/master >/dev/null 2>&1 || true
   else
-    say "Downloading llama.cpp"
+    say "Downloading llama.cpp sources"
     git clone --depth=1 https://github.com/ggml-org/llama.cpp.git "$SRC"
   fi
 
@@ -83,7 +172,7 @@ install_engine(){
     vulkan) args+=( -DGGML_VULKAN=ON );;
     cpu) args+=( -DGGML_OPENMP=ON -DGGML_CPU_ALL_VARIANTS=ON );;
   esac
-  say "Building $BACKEND backend"
+  say "Building $BACKEND backend from source (this can take ~10 minutes)"
   cmake "${args[@]}"
   cmake --build "$BUILD" --config Release --parallel "$(cores)"
   server="$BUILD/bin/llama-server"
@@ -96,10 +185,29 @@ install_engine(){
   fi
 }
 
+install_engine(){
+  if [[ "${CAPYBARA_ENGINE_SOURCE:-0}" == "1" ]]; then
+    say "CAPYBARA_ENGINE_SOURCE=1 set - building from source"
+    install_engine_source
+    return
+  fi
+  if try_prebuilt_engine; then
+    say "Engine installed from prebuilt binaries ($BACKEND)"
+    return
+  fi
+  install_deps
+  install_engine_source
+}
+
 install_python(){
   cp "$(dirname "$0")/capybara.py" "$BIN/capybara.py"
   cp "$(dirname "$0")/capybara.py" "$CAPYBARA_HOME/capybara.py"
-  cp "$(dirname "$0")/gui.py" "$CAPYBARA_HOME/gui.py"
+  cp "$(dirname "$0")/server.py" "$CAPYBARA_HOME/server.py"
+  mkdir -p "$CAPYBARA_HOME/ui"
+  cp "$(dirname "$0")/ui/index.html" "$CAPYBARA_HOME/ui/index.html"
+  if [[ -f "$(dirname "$0")/gui.py" ]]; then
+    cp "$(dirname "$0")/gui.py" "$CAPYBARA_HOME/gui.py"
+  fi
   chmod +x "$BIN/capybara.py"
 
   cat > "$INSTALL_BIN/capybara" <<EOF2
@@ -148,7 +256,11 @@ main(){
   say "Detected $OS_NAME $ARCH"
   detect_backend
   say "Backend: $BACKEND ($GPU)"
-  install_deps
+
+  if [[ "${CAPYBARA_ENGINE_ONLY:-0}" != "1" ]] && ! has python3; then
+    install_deps
+  fi
+
   install_engine
   if [[ "${CAPYBARA_ENGINE_ONLY:-0}" == "1" ]]; then
     say "Engine-only install requested; skipping CLI setup"
@@ -158,16 +270,16 @@ main(){
   write_env
   echo
   echo "Capybara installed."
-  echo "CLI: capybara"
-  echo "GUI: capybara-gui"
-  echo "Models: $MODELS"
-  echo "OpenAI API: http://127.0.0.1:11434/v1"
+  echo "CLI:     capybara"
+  echo "GUI:     capybara ui        (opens the built-in web app)"
+  echo "Models:  $MODELS"
+  echo "API:     http://127.0.0.1:11434/v1"
   echo
   echo "Try:"
   echo "  capybara pull smollm          # tiny 135M model, fast download"
+  echo "  capybara serve                # web UI at http://localhost:11434"
   echo "  capybara run smollm 'hi!'     # one-shot prompt"
-  echo "  capybara serve                # OpenAI-compatible API on :11434/v1"
-  echo "  capybara-gui"
+  echo "  capybara ui                   # chat in your browser"
   echo
   echo "Optional config: $CAPYBARA_HOME/config.yaml"
 }

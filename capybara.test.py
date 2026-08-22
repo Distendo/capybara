@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import capybara
+import server
 
 
 class ParseScalarTests(unittest.TestCase):
@@ -201,6 +202,170 @@ class SidecarTests(unittest.TestCase):
             messages, params = capybara.request_context(model)
             self.assertEqual(messages[0]["role"], "system")
             self.assertEqual(params, {"max_tokens": 32, "temperature": 0.5})
+
+
+class TrimHistoryTests(unittest.TestCase):
+    def test_trim_history_should_keep_short_histories_untouched(self):
+        history = [{"role": "user", "content": "hi"}]
+        self.assertEqual(capybara.trim_history(history, 1000), history)
+
+    def test_trim_history_should_drop_oldest_turns_first(self):
+        history = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "a" * 50},
+            {"role": "assistant", "content": "b" * 50},
+            {"role": "user", "content": "c" * 10},
+        ]
+        trimmed = capybara.trim_history(history, 80)
+        contents = [m["content"] for m in trimmed if m["role"] != "system"]
+        self.assertEqual(contents, ["b" * 50, "c" * 10])
+        self.assertEqual(trimmed[0]["role"], "system")
+
+    def test_trim_history_should_trim_down_to_budget(self):
+        history = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "a" * 50},
+            {"role": "assistant", "content": "b" * 50},
+            {"role": "user", "content": "c" * 10},
+        ]
+        trimmed = capybara.trim_history(history, 40)
+        contents = [m["content"] for m in trimmed if m["role"] != "system"]
+        self.assertEqual(contents, ["c" * 10])
+
+    def test_trim_history_should_always_keep_system_messages(self):
+        history = [
+            {"role": "system", "content": "s" * 60},
+            {"role": "user", "content": "u" * 200},
+        ]
+        trimmed = capybara.trim_history(history, 70)
+        self.assertEqual([m["role"] for m in trimmed], ["system"])
+
+
+class EngineDiscoveryTests(unittest.TestCase):
+    def test_settings_should_expose_internal_engine_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = capybara.Settings(Path(tmp), {"server": {"port": 11434}})
+            self.assertEqual(settings.engine_port, 11435)
+
+    def test_resolve_engine_should_prefer_existing_configured_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = Path(tmp) / "custom-llama-server"
+            custom.write_bytes(b"x")
+            resolved = capybara.Settings._resolve_engine(str(custom))
+            self.assertEqual(resolved, custom)
+
+    def test_resolve_engine_should_fall_back_to_path_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "llama-server"
+            fake.write_bytes(b"x")
+            empty_home = Path(tmp) / "empty-home"
+            empty_home.mkdir()
+            env = {"CAPYBARA_HOME": str(empty_home)}
+            with mock.patch.dict(os.environ, env, clear=False), \
+                 mock.patch("shutil.which", return_value=str(fake)):
+                resolved = capybara.Settings._resolve_engine(None)
+            self.assertEqual(resolved, fake)
+
+    def test_resolve_engine_should_default_to_home_bin(self):
+        home = Path("/nonexistent-capybara-home-for-tests")
+        with mock.patch.dict(os.environ, {"CAPYBARA_HOME": str(home)}, clear=False), \
+             mock.patch("shutil.which", return_value=None):
+            resolved = capybara.Settings._resolve_engine(None)
+        self.assertEqual(resolved, home / "bin" / "llama-server")
+
+
+class StateSafetyTests(unittest.TestCase):
+    def _settings(self, tmp: Path) -> capybara.Settings:
+        return capybara.Settings(tmp, {})
+
+    def test_state_is_ours_should_reject_missing_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(Path(tmp))
+            self.assertFalse(capybara.state_is_ours(settings))
+
+    def test_state_is_ours_should_check_process_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(Path(tmp))
+            settings.run_dir.mkdir(parents=True)
+            settings.state_file.write_text(json.dumps({
+                "mode": "gateway", "gateway_pid": 424242,
+                "pid": 424243, "model": "x.gguf",
+            }))
+            with mock.patch.object(capybara, "process_comm", return_value="Python"):
+                self.assertTrue(capybara.state_is_ours(settings))
+            with mock.patch.object(capybara, "process_comm", return_value="vim"):
+                self.assertFalse(capybara.state_is_ours(settings))
+
+    def test_stop_server_should_not_kill_unrelated_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(Path(tmp))
+            settings.run_dir.mkdir(parents=True)
+            settings.state_file.write_text(json.dumps({
+                "mode": "gateway", "gateway_pid": 999001, "pid": 999002,
+            }))
+            killed = []
+            with mock.patch.object(capybara, "process_comm", return_value="nginx"), \
+                 mock.patch.object(capybara.os, "kill",
+                                   side_effect=lambda p, s: killed.append((p, s))):
+                capybara.stop_server(settings)
+            self.assertEqual(killed, [])
+            self.assertFalse(settings.state_file.exists())
+
+
+class GatewaySidecarTests(unittest.TestCase):
+    """Tests for the gateway module's request enrichment."""
+
+    def _manager_with_model(self, tmp: Path) -> object:
+        import server
+        settings = capybara.Settings(tmp, {})
+        mgr = server.EngineManager(settings)
+        model = Path(tmp) / "m.gguf"
+        model.write_bytes(b"x")
+        model.with_suffix(".capybara.json").write_text(json.dumps({
+            "system": "stay terse",
+            "params": {"temperature": 0.2, "num_predict": 48},
+        }))
+        mgr.model = model
+        return mgr
+
+    def test_inject_sidecar_should_add_system_and_params(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = self._manager_with_model(Path(tmp))
+            body = {"messages": [{"role": "user", "content": "hello"}]}
+            out = server.inject_sidecar(mgr, body)
+            self.assertEqual(out["messages"][0]["role"], "system")
+            self.assertEqual(out["messages"][0]["content"], "stay terse")
+            self.assertEqual(out["temperature"], 0.2)
+            self.assertEqual(out["max_tokens"], 48)
+
+    def test_inject_sidecar_should_respect_client_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = self._manager_with_model(Path(tmp))
+            body = {
+                "messages": [{"role": "system", "content": "client wins"},
+                             {"role": "user", "content": "hi"}],
+                "temperature": 1.5,
+            }
+            out = server.inject_sidecar(mgr, body)
+            self.assertEqual(out["temperature"], 1.5)
+            self.assertEqual(out["messages"][0]["content"], "client wins")
+
+
+class PortGuardTests(unittest.TestCase):
+    def _settings(self, tmp: Path, port: int) -> capybara.Settings:
+        return capybara.Settings(tmp, {"server": {"port": port}})
+
+    def test_port_has_listener_should_detect_open_sockets(self):
+        import socket
+        with tempfile.TemporaryDirectory() as tmp:
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                sock.listen(1)
+                port = sock.getsockname()[1]
+                settings = self._settings(Path(tmp), port)
+                self.assertTrue(capybara.port_has_listener(settings))
+            settings2 = self._settings(Path(tmp), 1)
+            self.assertFalse(capybara.port_has_listener(settings2))
 
 
 if __name__ == "__main__":
