@@ -505,5 +505,192 @@ class PortGuardTests(unittest.TestCase):
             self.assertFalse(capybara.port_has_listener(settings2))
 
 
+class KeepAliveTests(unittest.TestCase):
+    def test_parse_keep_accepts_ollama_durations(self):
+        cases = {
+            None: 300.0,          # default
+            "": 300.0,
+            "5m": 300.0,
+            "90": 90.0,
+            "90s": 90.0,
+            "2h": 7200.0,
+            "1h30m": 5400.0,
+            "500ms": 0.5,
+            0: 0.0,
+            -1: float("inf"),
+            "-1": float("inf"),
+            "garbage": 300.0,
+            True: 300.0,
+        }
+        for value, expected in cases.items():
+            self.assertEqual(capybara.parse_keep_alive(value), expected,
+                             repr(value))
+
+    def test_parse_keep_honours_custom_default(self):
+        self.assertEqual(capybara.parse_keep_alive(None, default=42.0), 42.0)
+        self.assertEqual(capybara.parse_keep_alive("bogus", default=7.0), 7.0)
+
+    def test_settings_should_read_keep_alive_from_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "config.yaml").write_text("runtime:\n  keep_alive: 30s\n")
+            settings = capybara.load_settings(home)
+            self.assertEqual(settings.keep_alive_raw, "30s")
+
+
+class OllamaOptionsTests(unittest.TestCase):
+    def test_options_map_to_engine_params(self):
+        out = capybara.ollama_options_to_openai({
+            "temperature": 0.3, "num_predict": 64, "top_k": 40,
+            "stop": "END", "repeat_penalty": 1.1, "seed": 9,
+        })
+        self.assertEqual(out, {"temperature": 0.3, "max_tokens": 64,
+                               "top_k": 40, "stop": ["END"],
+                               "repeat_penalty": 1.1, "seed": 9})
+
+    def test_unmappable_and_unknown_options_are_dropped(self):
+        out = capybara.ollama_options_to_openai({
+            "num_ctx": 8192, "mirostat": 2, "wat": 1, "temperature": 0.5,
+        })
+        self.assertEqual(out, {"temperature": 0.5})
+
+    def test_non_dict_input_is_ignored(self):
+        self.assertEqual(capybara.ollama_options_to_openai(None), {})
+        self.assertEqual(capybara.ollama_options_to_openai("x"), {})
+
+
+class OllamaApiTests(unittest.TestCase):
+    """End-to-end handler tests against a stubbed EngineManager."""
+
+    def setUp(self) -> None:
+        import server
+        self.server = server
+
+    def _manager(self, tmp: Path) -> Any:
+        mgr = self.server.EngineManager(capybara.Settings(tmp, {}))
+        return mgr
+
+    def _request(self, method: str, path: str, body: bytes = b""):
+        """Drive the Gateway handler without opening sockets."""
+        import io
+        from http.server import BaseHTTPRequestHandler
+
+        captured: Dict[str, Any] = {}
+
+        class Sink:
+            def __init__(self) -> None:
+                self.buffer = io.BytesIO()
+
+            def write(self, data: bytes) -> int:
+                return self.buffer.write(data)
+
+            def flush(self) -> None:
+                pass
+
+            def getvalue(self) -> bytes:
+                return self.buffer.getvalue()
+
+        sink = Sink()
+        handler = object.__new__(self.server.Gateway)
+        handler.command = method
+        handler.path = path
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.wfile = sink
+        handler.close_connection = False
+
+        def fake_send_response(code: int, *a: Any, **k: Any) -> None:
+            captured["status"] = code
+
+        def fake_send_header(k: str, v: str) -> None:
+            captured.setdefault("headers", []).append((k, v))
+
+        def fake_end_headers() -> None:
+            pass
+
+        handler.send_response = fake_send_response
+        handler.send_header = fake_send_header
+        handler.end_headers = fake_end_headers
+        captured["handler"] = handler
+        captured["sink"] = sink
+        return handler, captured
+
+    @staticmethod
+    def _json_lines(raw: bytes) -> List[Dict[str, Any]]:
+        import json as _json
+        return [_json.loads(line) for line in raw.decode().splitlines() if line]
+
+    def test_api_version_and_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = self._manager(Path(tmp))
+            (Path(tmp) / "models").mkdir()
+            model = Path(tmp) / "models" / "tiny-1b.gguf"
+            model.write_bytes(b"x")
+            self.server.Gateway.manager = mgr
+            for method, path in (("GET", "/api/version"), ("GET", "/api/tags")):
+                handler, captured = self._request(method, path)
+                handler.do_GET()
+                payload = self._json_lines(captured["sink"].getvalue())[0]
+                if path == "/api/version":
+                    self.assertEqual(payload["version"], capybara.VERSION)
+                else:
+                    names = [m["name"] for m in payload["models"]]
+                    self.assertIn("tiny-1b:latest", names)
+
+    def test_api_chat_requires_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = self._manager(Path(tmp))
+            self.server.Gateway.manager = mgr
+            handler, captured = self._request(
+                "POST", "/api/chat", b'{"model":"x","messages":[]}')
+            handler.api_chat()
+            self.assertEqual(captured["status"], 400)
+            payload = self._json_lines(captured["sink"].getvalue())[0]
+            self.assertIn("messages", payload["error"])
+
+    def test_api_chat_unknown_model_is_404(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = self._manager(Path(tmp))
+            (Path(tmp) / "models").mkdir(exist_ok=True)
+            self.server.Gateway.manager = mgr
+            handler, captured = self._request(
+                "POST", "/api/chat",
+                b'{"model":"nope","messages":[{"role":"user","content":"hi"}]}')
+            handler.api_chat()
+            self.assertEqual(captured["status"], 404)
+
+    def test_api_generate_requires_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = self._manager(Path(tmp))
+            self.server.Gateway.manager = mgr
+            handler, captured = self._request(
+                "POST", "/api/generate", b'{"model":"x"}')
+            handler.api_generate()
+            self.assertEqual(captured["status"], 400)
+
+    def test_usage_snapshot_reports_expires_at(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            models_dir = Path(tmp) / "models"
+            models_dir.mkdir(parents=True)
+            model = models_dir / "tiny-1b-Q4_K_M.gguf"
+            model.write_bytes(b"x")
+            mgr = self._manager(Path(tmp))
+            mgr.settings.models = models_dir
+            mgr.model = model
+            snap = mgr.usage_snapshot()
+            self.assertEqual(len(snap["models"]), 1)
+            entry = snap["models"][0]
+            self.assertEqual(entry["details"]["quantization_level"], "Q4_K_M")
+            self.assertTrue(entry["expires_at"])
+            mgr.keep_alive = float("inf")
+            self.assertIsNone(mgr.usage_snapshot()["models"][0]["expires_at"])
+
+    def test_param_size_guess(self):
+        self.assertEqual(self.server.param_size_guess("qwen-7B-instruct.gguf"), "7B")
+        self.assertEqual(self.server.param_size_guess("SmolLM2-135M-Instruct.gguf"),
+                         "135M")
+        self.assertEqual(self.server.param_size_guess("mystery-model.gguf"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

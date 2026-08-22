@@ -83,9 +83,13 @@ Hello! How can I assist you today?
 Inside `capybara run`:
 
 ```
-/bye     exit (also /exit, /quit, Ctrl-D)
-/clear   reset the conversation
-/help    list commands
+/bye          exit (also /exit, /quit, Ctrl-D)
+/clear        reset the conversation
+/load <m>     switch to another installed model
+/show         show the loaded model's template and parameters
+/set system   set a system prompt for this session
+"""           start/end a multi-line message
+/help         list commands
 ```
 
 ## Models
@@ -158,7 +162,42 @@ The webui port defaults to 8080; override with `CAPYBARA_WEBUI_PORT`.
 
 ## API
 
-Capybara serves an OpenAI-compatible API on:
+Capybara is **Ollama-compatible**. Point any Ollama client at:
+
+```
+http://localhost:11434
+```
+
+Ollama endpoints:
+
+```
+POST /api/chat      chat with a model (NDJSON stream, like Ollama)
+POST /api/generate  raw prompt generation (NDJSON stream, like Ollama)
+GET  /api/tags      list installed models
+POST /api/show      model metadata (modelfile template, parameters)
+POST /api/pull      download a model from Hugging Face or the Ollama library
+DELETE /api/delete  remove an installed model
+GET  /api/ps        currently loaded model + unload timer
+```
+
+Requests accept standard Ollama fields (`messages`, `prompt`, `stream`,
+`options`, `keep_alive`, `think`). Reasoning models (QwQ, DeepSeek-R1,
+ornith, ...) stream their chain of thought in a separate `thinking` field,
+exactly like Ollama. The `keep_alive` field controls how long the model
+stays loaded after the last request (`"5m"` default; `"90s"`, `"2h"`,
+`"-1"` for forever all work). Models are hot-swapped automatically when
+you request a different one - no restart needed.
+
+Example:
+
+```bash
+curl http://localhost:11434/api/chat -d '{
+  "model": "llama3",
+  "messages": [{ "role": "user", "content": "Hello" }]
+}'
+```
+
+The same port also serves an OpenAI-compatible API on:
 
 ```
 http://localhost:11434/v1
@@ -181,11 +220,11 @@ curl http://localhost:11434/v1/chat/completions \
 ```
 
 It can therefore be used with applications that already support
-OpenAI-compatible endpoints. The same port also exposes management endpoints
+OpenAI-compatible endpoints. The port also exposes management endpoints
 used by the Web UI:
 
 ```
-GET  /api/status   server + engine state, uptime, current model
+GET  /api/status   server + engine state, uptime, current model, keep-alive
 GET  /api/models   installed models (loaded flag)
 POST /api/use      {"model": "name"} - hot-swap the loaded model
 ```
@@ -221,6 +260,7 @@ runtime:
   gpu_layers: 999     # layers offloaded to GPU (default: all)
   batch: 2048
   ubatch: 512
+  keep_alive: 5m      # unload the model after this much idle time (default: 5m)
 
 server:
   host: 127.0.0.1
@@ -234,7 +274,7 @@ Precedence: defaults < `config.yaml` < environment variables.
 Every key has a matching env override: `CAPYBARA_HOST`, `CAPYBARA_PORT`,
 `CAPYBARA_MODELS`, `CAPYBARA_THREADS`, `CAPYBARA_CONTEXT`,
 `CAPYBARA_GPU_LAYERS`, `CAPYBARA_BATCH`, `CAPYBARA_UBATCH`,
-`CAPYBARA_HOME`.
+`CAPYBARA_KEEP_ALIVE`, `CAPYBARA_HOME`.
 
 The configuration file is optional. Capybara works with sensible defaults
 when it is not present.

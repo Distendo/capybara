@@ -28,13 +28,14 @@ from typing import Any, Dict, List, Optional, Tuple
 IS_WINDOWS = os.name == "nt"
 EXE = ".exe" if IS_WINDOWS else ""
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11434
 DEFAULT_WEBUI_PORT = 8080
 DEFAULT_CONTEXT = 10240
 DEFAULT_BATCH = 2048
 DEFAULT_UBATCH = 512
+DEFAULT_KEEP_ALIVE = "5m"
 HF_API = "https://huggingface.co/api/models"
 HF_RESOLVE = "https://huggingface.co/{repo}/resolve/main/{file}"
 OLLAMA_REGISTRY = "https://registry.ollama.ai"
@@ -126,6 +127,8 @@ class Settings:
         self.ubatch = int(pick("CAPYBARA_UBATCH", "runtime", "ubatch", default=DEFAULT_UBATCH))
         gpu_layers = pick("CAPYBARA_GPU_LAYERS", "runtime", "gpu_layers", default=999)
         self.gpu_layers = int(gpu_layers)
+        self.keep_alive_raw = str(pick("CAPYBARA_KEEP_ALIVE", "runtime", "keep_alive",
+                                       default=DEFAULT_KEEP_ALIVE))
         self.bin_dir = home / "bin"
         self.run_dir = home / "run"
         self.server_bin = self._resolve_engine(pick(
@@ -192,6 +195,78 @@ def parse_scalar(raw: str) -> Any:
         except ValueError:
             continue
     return text
+
+
+def parse_keep_alive(value: Any, default: float = 300.0) -> float:
+    """Parse an Ollama-style duration into seconds.
+
+    Accepts numbers (seconds) or strings like "90", "90s", "5m", "2h",
+    compound forms such as "1h30m", and the specials "-1"/"0" (never
+    unload / unload right after each response). Invalid input falls back
+    to ``default``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float("inf") if value < 0 else float(value)
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    try:
+        num = float(text)
+        return float("inf") if num < 0 else num
+    except ValueError:
+        pass
+    units = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+    total = 0.0
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(ms|[smh])?", text):
+        total += float(number) * units.get(unit or "s", 1.0)
+    return total if total > 0 else default
+
+
+# Ollama request 'options' -> llama.cpp OpenAI fields. Keys mapped to None
+# are accepted but cannot be applied to a running engine (ctx is fixed at
+# spawn time); anything outside this table is dropped.
+OLLAMA_OPTIONS_MAP: Dict[str, Optional[str]] = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "top_k": "top_k",
+    "min_p": "min_p",
+    "repeat_penalty": "repeat_penalty",
+    "presence_penalty": "presence_penalty",
+    "frequency_penalty": "frequency_penalty",
+    "seed": "seed",
+    "num_predict": "max_tokens",
+    "max_tokens": "max_tokens",
+    "stop": "stop",
+    "num_ctx": None,
+    "num_batch": None,
+    "num_gpu": None,
+    "mirostat": None,
+    "mirostat_eta": None,
+    "mirostat_tau": None,
+    "tfs_z": None,
+    "typical_p": None,
+    "num_keep": None,
+    "penalize_newline": None,
+}
+
+
+def ollama_options_to_openai(options: Any) -> Dict[str, Any]:
+    """Translate an Ollama request's options dict into engine parameters."""
+    if not isinstance(options, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key, value in options.items():
+        target = OLLAMA_OPTIONS_MAP.get(str(key), False)
+        if target and value is not None:
+            out[target] = value
+    # Ollama sends stop as a string; engines expect a list.
+    if isinstance(out.get("stop"), str):
+        out["stop"] = [out["stop"]]
+    return out
 
 
 def parse_config_text(text: str) -> Dict[str, Any]:
@@ -998,27 +1073,101 @@ def chat_payload(model_name: str, history: List[Dict[str, str]],
     return {"model": model_name, "messages": history, **params}
 
 
+def read_multiline(first: str) -> str:
+    """Collect a triple-quoted multi-line prompt (Ollama REPL style)."""
+    body = first[3:]
+    end = body.find('"""')
+    if end != -1:
+        return body[:end]
+    parts = [body]
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        end = line.find('"""')
+        if end != -1:
+            parts.append(line[:end])
+            break
+        parts.append(line)
+    return "\n".join(parts)
+
+
 def interactive_chat(settings: Settings, model: Path) -> None:
     """Run a REPL chat session against the given model."""
     system_msgs, params = request_context(model)
     history: List[Dict[str, str]] = list(system_msgs)
     budget = max(1024, int(settings.context * 3.5))
-    print(f"Capybara running {model.name}. Type /bye to exit, /clear to reset.")
+    print(f"Capybara running {model.name}. Type /? for help.")
     while True:
         try:
-            prompt = input(">>> ")
+            raw = input(">>> ")
         except (EOFError, KeyboardInterrupt):
             print()
             return
-        prompt = prompt.strip()
+        if raw.strip().startswith('"""'):
+            prompt = read_multiline(raw.strip())
+            if not prompt.strip():
+                continue
+            history.append({"role": "user", "content": prompt})
+            history = trim_history(history, budget)
+            try:
+                reply, _stats = stream_chat_completions(
+                    settings, chat_payload(model.name, history, params))
+                history.append({"role": "assistant", "content": reply})
+            except Exception as exc:
+                history.pop()
+                print(f"capybara: {exc}")
+            continue
+        prompt = raw.strip()
         if prompt in ("/bye", "/exit", "/quit"):
             return
         if prompt == "/clear":
             history = list(system_msgs)
             print("context cleared")
             continue
-        if prompt == "/help":
-            print("/bye exit | /clear reset conversation")
+        if prompt in ("/?", "/help"):
+            print("/bye|/exit|/quit  leave the session")
+            print("/clear            reset the conversation")
+            print("/load MODEL       switch to another installed model")
+            print("/show info|system show model details or its system prompt")
+            print('/set system TEXT  replace the system prompt')
+            print('"""..."""         enter a multi-line message')
+            continue
+        if prompt.startswith("/load"):
+            wanted = prompt[5:].strip()
+            target = resolve_model_or_alias(settings, wanted) if wanted else None
+            if target is None:
+                installed = ", ".join(n for n, _ in group_models(list_models(settings)))
+                print(f"capybara: unknown model '{wanted}'. Installed: {installed}")
+                continue
+            model = target
+            system_msgs, params = request_context(model)
+            history = list(system_msgs)
+            print(f"switched to {model.name}")
+            continue
+        if prompt.startswith("/show"):
+            what = prompt[5:].strip() or "info"
+            meta = sidecar_for(model) or {}
+            if what == "system":
+                print(meta.get("system") or "(no system prompt)")
+            else:
+                print(f"model    {model.name}")
+                print(f"size     {human_size(model.stat().st_size)}")
+                if meta.get("base"):
+                    print(f"base     {meta['base']}")
+                pretty = ", ".join(f"{k}={v}" for k, v in sorted((meta.get("params") or {}).items()))
+                if pretty:
+                    print(f"params   {pretty}")
+            continue
+        if prompt.startswith("/set system"):
+            text = prompt[len("/set system"):].strip().strip('"').strip("'")
+            if text:
+                system_msgs = [{"role": "system", "content": text}]
+            else:
+                system_msgs = []
+            history = list(system_msgs)
+            print("system prompt updated" if text else "system prompt cleared")
             continue
         if not prompt:
             continue
@@ -1169,6 +1318,10 @@ def do_ps(settings: Settings) -> None:
         print("STOPPED")
         return
     uptime = time.time() - float(state.get("started_at", time.time()))
+    if state.get("idle_unloaded") or not state.get("model"):
+        print(f"GATEWAY  url=http://{state.get('host')}:{state.get('port')}  "
+              f"uptime={int(uptime)}s  model=(unloaded, idle)")
+        return
     print(f"RUNNING  mode={state.get('mode', 'gateway')}  "
           f"model={state.get('model')}  "
           f"url=http://{state.get('host')}:{state.get('port')}  "
