@@ -71,12 +71,20 @@ jobs:
         env:
           CAPYBARA_HOME: ${{ github.workspace }}\cap-home
         run: |
-          python stage/capybara.py --version
-          python stage/capybara.py pull smollm
-          python stage/capybara.py run smollm "Reply with exactly: WINDOWS OK"
-          python stage/capybara.py ps
-          python stage/capybara.py stop
-          python stage/capybara.py list
+          # pwsh does not fail on native command exit codes by default.
+          function Run([string]$cmd) {
+            Write-Host ">> $cmd"
+            Invoke-Expression $cmd
+            if ($LASTEXITCODE -ne 0) { throw "FAILED (exit $LASTEXITCODE): $cmd" }
+          }
+          Run "python stage/capybara.py --version"
+          Run "python stage/capybara.py pull smollm"
+          Run "python stage/capybara.py run smollm `"Reply with exactly: WINDOWS OK`""
+          Run "python stage/capybara.py ps"
+          Run "python stage/capybara.py generate smollm `"2+2=`""
+          Run "python stage/capybara.py stop"
+          $env:CAPYBARA_HOME = ""
+          Run "python stage/capybara.py list"
 
       - name: Zip package
         shell: pwsh

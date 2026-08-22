@@ -134,12 +134,14 @@ class Settings:
         self.state_file = self.run_dir / "server.json"
 
     def _resolve_engine(self, configured: Any) -> Path:
-        """Locate llama-server: config path > install dir > PATH."""
+        """Locate llama-server: config path > app dir > install dir > PATH."""
         candidates: List[Path] = []
         if configured:
             candidates.append(Path(str(configured)).expanduser())
-        # Use this Settings' own home - never probe the ambient environment,
-        # which may be scrubbed (tests, services) on any platform.
+        # Next to this script - covers portable installs where the engine
+        # ships inside the same folder tree as capybara.py.
+        candidates.append(Path(__file__).resolve().parent / "bin"
+                          / f"llama-server{EXE}")
         candidates.append(self.home / "bin" / f"llama-server{EXE}")
         found = shutil.which("llama-server")
         if found:
@@ -855,7 +857,8 @@ def start_server(settings: Settings, model: Path, foreground: bool = False,
     """Start the full stack (gateway + engine) serving `model`."""
     del extra_args  # engine tuning lives in config.yaml since v1.0
     if not settings.server_bin.exists():
-        die(f"engine not found at {settings.server_bin} - run ./install.sh first")
+        die(f"engine not found at {settings.server_bin} - place llama-server "
+            "there, in this app's bin/ folder, or on PATH")
     foreign_port_guard(settings)
     if port_has_listener(settings, settings.engine_port):
         die(f"internal engine port {settings.engine_port} is already in use - "

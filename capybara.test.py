@@ -264,11 +264,35 @@ class EngineDiscoveryTests(unittest.TestCase):
                 resolved = capybara.Settings(empty_home, {})._resolve_engine(None)
             self.assertEqual(resolved, fake)
 
-    def test_resolve_engine_should_default_to_home_bin(self):
-        home = Path("/nonexistent-capybara-home-for-tests")
-        with mock.patch("shutil.which", return_value=None):
-            resolved = capybara.Settings(home, {})._resolve_engine(None)
-        self.assertEqual(resolved, home / "bin" / f"llama-server{capybara.EXE}")
+    def test_resolve_engine_should_default_to_script_dir_bin(self):
+        """With no engine anywhere, point the error message at the
+        highest-priority default (bundled location next to capybara.py)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            appdir = (Path(tmp) / "app").resolve()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            with mock.patch.object(capybara, "__file__", str(appdir / "capybara.py")), \
+                 mock.patch("shutil.which", return_value=None):
+                resolved = capybara.Settings(home, {})._resolve_engine(None)
+            self.assertEqual(resolved,
+                             appdir / "bin" / f"llama-server{capybara.EXE}")
+            self.assertFalse(resolved.exists())
+
+    def test_resolve_engine_should_find_bundled_engine_next_to_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Resolve first: on macOS tempfile paths contain symlinks that
+            # _resolve_engine normalises away.
+            appdir = (Path(tmp) / "app").resolve()
+            (appdir / "bin").mkdir(parents=True)
+            (appdir / "bin" / f"llama-server{capybara.EXE}").write_bytes(b"x")
+            empty_home = Path(tmp) / "home"
+            empty_home.mkdir()
+            with mock.patch.object(capybara, "__file__", str(appdir / "capybara.py")), \
+                 mock.patch("shutil.which", return_value=None):
+                resolved = capybara.Settings(empty_home, {})._resolve_engine(None)
+            self.assertEqual(resolved,
+                             appdir / "bin" / f"llama-server{capybara.EXE}")
+            self.assertTrue(resolved.exists())
 
 
 class StateSafetyTests(unittest.TestCase):
