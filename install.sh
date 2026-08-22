@@ -90,7 +90,10 @@ install_engine(){
   [[ -x "$server" ]] || die "llama-server build failed"
   cp "$server" "$BIN/llama-server"
   chmod +x "$BIN/llama-server"
-  [[ -x "$BUILD/bin/llama-cli" ]] && cp "$BUILD/bin/llama-cli" "$BIN/llama-cli" && chmod +x "$BIN/llama-cli" || true
+  if [[ -x "$BUILD/bin/llama-cli" ]]; then
+    cp "$BUILD/bin/llama-cli" "$BIN/llama-cli"
+    chmod +x "$BIN/llama-cli"
+  fi
 }
 
 install_python(){
