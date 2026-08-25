@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 IS_WINDOWS = os.name == "nt"
 EXE = ".exe" if IS_WINDOWS else ""
 
-VERSION = "1.1.0"
+VERSION = "1.3.1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11434
 DEFAULT_WEBUI_PORT = 8080

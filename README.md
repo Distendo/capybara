@@ -1,5 +1,11 @@
 # Capybara
 
+<p align="center">
+	<img src="img/logo.webp" alt="Capybara screenshot">
+</p>
+
+# Ollama, but much better.
+
 Single-file local LLM runner. No backends, no agents, no GUI — just `pip install` and go.
 
 ```bash
